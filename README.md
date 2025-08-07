@@ -13,29 +13,45 @@ These datasets need to be downloaded to "DATA" folder under the project path.
 
 
 ## Environment
-The Python environment to run the codes can be reproduced using "deepx-gan_ENV.yml" file by conda in the console:
-``` bash
-$ conda env create -f deepx-gan_ENV.yml
+To reproduce the Python environment, use the provided Conda environment file `deepx-gan_ENV.yml`:
+```bash
+conda env create -f deepx-gan_ENV.yml
 ```
 
-## Structure
-- The model architecture is defined in `models_parallel.py`;
-- The functions used for data loading and preprocessing are defined in `data_utils.py` (note that the data will be loaded from `/DATA/` folder so remember to download datasets and store to the right location);
-- The functions related to loss function are defined in `gan_utils.py`;
-- The functions related to computing the spatial dependence structure metric DeepX are defined in `spatial_utils.py`;
-- The training details are defined in `train_parallel.py`;
-- The main function to start the training is defined in `main_parallel.py`.
+This will create a new environment with all required dependencies.
+
+
+## Code structure
+- `main_parallel.py`: the entry point to configure and start training.
+- `train_parallel.py`: defines the training process.
+- `models_parallel.py`: defines the model architecture.
+- `data_utils.py`: handles data loading and preprocessing.
+    > **Note**: The code expects datasets to be stored in the `/DATA/` directory. Please ensure you download and place the datasets in the correct location.
+- `gan_utils.py`: contains the loss functions used for training.
+- `spatial_utils.py`: implements the computation of the DeepX spatial dependence metric.
 
 
 ## Get started
-You may change all the relevant hyperparameters in `main_parallel.py` or input into the terminal as, e.g., `python main_parallel.py -d tmax -ne 1000`. Then, run `main_parallel.py` to start training the model. 
+### Running the model
+You can configure all relevant hyperparameters either by modifying `main_parallel.py` directly or by passing arguments via the command line. For example:
+```bash
+python main_parallel.py -d tmax -ne 1000
+```
 
+This will start training the model with `tmax` as the target data and `1000` training epochs.
+
+### Parallel GPU training
+The code is designed for parallel training on multiple GPUs. Please ensure you configure the following hyperparameters in `main_parallel.py`:
+- `parallel_ids`: a list specifying the GPU device IDs to use in parallel (e.g., `[0, 1]`).
+- `cuda_num`: the ID of the main GPU that handles model aggregation and loss computation.
+
+Make sure the specified GPUs are available on your machine.
 
 ## Expected output
 The log file and trained models will be stored in `/trained/run_name/`, where `run_name` is automatically created using the training dataset, training method, date, and time information.
 
 The generator and discriminator losses will be output in the terminal and stored in a log file, which could be retrieved in a tensorboard by:
-``` bash
+```bash
 tensorboard --logdir=log
 ```
 
@@ -52,3 +68,9 @@ which usually comes from packages like `xarray` or `cartopy` that can optionally
 UserWarning: RNN module weights are not part of single contiguous chunk of memory. This means they need to be compacted at every call, possibly greatly increasing memory usage. To compact weights again call flatten_parameters().
 ```
 which commonly happens when using `nn.DataParallel` as a performance warning.
+
+## Reproducibility & performance
+The code has been tested for reproducibility on **Ubuntu 20.04** using **two NVIDIA RTX A6000 GPUs**. However, it should be compatible with other operating systems and GPU models, provided that your Python environment is correctly configured. 
+
+- **Environment setup**: Creating the Conda environment typically takes about **10–20 minutes**.
+- **Training speed**: On the above setup, training takes approximately **4.5 seconds per iteration** with a batch size of `32` and the dataset `tmax`.
