@@ -21,41 +21,35 @@ from models_parallel import *
 
 
 def train(args):
-    # t0 = time.time()
-    # print('\n Training starts. Time elapsed on working...')
+    """
+        Main training function for the DeepX-GAN model.
 
-    test = args.test
+    :param args: command line arguments
+    """
+    # test = args.test
     dname = args.dname
     time_steps = args.time_steps
     batch_size = args.batch_size
     batch_size_half = args.batch_size//2
-    path = args.path
-    seed = args.seed
+    seed = args.seed  # Random seed for reproducibility
     save_freq = args.save_freq
 
-    # #### Added
     u = args.u
     pre_trained_path = args.pre_trained_path
     iter_final = args.iter_final
     x_size = args.x_size
     sample_method = args.sample_method
     cuda_num = args.cuda_num
-    woExt = args.woExt
     season = args.season
-    scratch_dir = '/path_to_output_folder/'
+    scratch_dir = args.path   
     parallel_ids = args.parallel_ids
     theta1 = args.theta1
     theta2 = args.theta2
-    ######
 
     if dname == 'lgcp':
         dataset, x_height, x_width = fetch_lgcp(time_steps=time_steps, x_size=x_size, method=sample_method)
-    elif dname == 't2m':
-        dataset, x_height, x_width = fetch_t2m(time_steps=time_steps, x_size=x_size, method=sample_method)
-    elif (dname in ['prate', 'cprat', 'air', 'tmax']) & (woExt is False):
+    elif (dname in ['air', 'tmax']):
         dataset, x_height, x_width = fetch_climate(dname, time_steps=time_steps, season=season)
-    elif (dname in ['prate', 'cprat', 'air', 'tmax']) & (woExt is True):
-        dataset, x_height, x_width = fetch_climate_woExt(dname, time_steps=time_steps, ext_order=100)
 
     # Calculate spatio-temporal embedding
     embedding_op = args.embedding_op
@@ -68,14 +62,10 @@ def train(args):
       b = torch.exp(-torch.stack([torch.abs(torch.arange(0, time_steps) - t) for t in range(0,time_steps)]) / b)
 
     w_sparse = make_sparse_weight_matrix(x_height, x_width)
-    if args.embedding_op == "moran":
+    if embedding_op == "moran":
         data_emb = make_mis(dataset.data, w_sparse)
-    elif args.embedding_op == "spate":
-        # t10 = time.time()
-        # print("Time consumed before make_spates() for real data: ", t10-t0)
+    elif embedding_op == "spate":
         data_emb = make_spates(dataset.data, w_sparse, b, stx_method, u, theta1=theta1, theta2=theta2)   # (x, w_sparse, b, method="skw", u=None)
-        # t11 = time.time()
-        # print("Time consumed during make_spates() for real data: ", t11-t10)
     else:
         data_emb = dataset.data
     # Concatenate data
@@ -117,7 +107,7 @@ def train(args):
     y_dim = args.y_dims
     j_dims = 16
 
-#### added
+#### Consume pre-trained models if available
     if pre_trained_path is not None:
         if os.listdir(pre_trained_path):
             for dirpath, dirnames, filenames in os.walk(pre_trained_path):
@@ -136,18 +126,17 @@ def train(args):
         generator = handle_tuple_err(generator)
         discriminator_h = handle_tuple_err(discriminator_h)
         discriminator_m = handle_tuple_err(discriminator_m)
-###############
 
+#### Create new instances of generator, discriminator_h and discriminator_m
     else:
         generator = VideoDCG(time_steps, x_h=x_height, x_w=x_width, filter_size=g_filter_size,
                              state_size=g_state_size, bn=bn, output_act='sigmoid', nchannel=channels)
         if torch.cuda.device_count() > 1:
-            print("Let's use", torch.cuda.device_count(), "GPUs!")
-            # dim = 0 [30, xxx] -> [10, ...], [10, ...], [10, ...] on 3 GPUs
+            print("You have", torch.cuda.device_count(), "GPUs, and will use", parallel_ids, "for parallel training.")
             generator = nn.DataParallel(generator, device_ids=parallel_ids)
         generator.to(device)
 
-        if args.embedding_op == "none":
+        if embedding_op == "none":
             discriminator_h = VideoDCD(x_h=x_height, x_w=x_width, filter_size=d_filter_size, j=j_dims,
                                        nchannel=channels, bn=bn).to(device)
             discriminator_m = VideoDCD(x_h=x_height, x_w=x_width, filter_size=d_filter_size, j=j_dims,
@@ -165,21 +154,16 @@ def train(args):
                 discriminator_m = nn.DataParallel(discriminator_m, device_ids=parallel_ids)
             discriminator_m.to(device)
 
-    test_ = dname + "-" + args.loss_func + '-' + args.embedding_op
+    test_ = dname + "-" + args.loss_func + '-' + embedding_op
     
-    if args.embedding_op=="spate":   # changed from "bea" to "spate"
-      test_ = test_ + '-' + args.stx_method
-    if args.stx_method=="ow":
-      test_ = test_ + "l" + str(args.dec_weight)
+    if embedding_op=="spate":   # changed from "bea" to "spate"
+      test_ = test_ + '-' + stx_method
 
-    # Modified, otherwise prompt errors
-    saved_file = "{}_{}{}-{}.{}.{}.{}".format(test_,
+    saved_file = "{}_{}{}-{}.{}".format(test_,
                                               datetime.now().strftime("%h"),
                                               datetime.now().strftime("%d"),
                                               datetime.now().strftime("%H"),
-                                              datetime.now().strftime("%M"),
-                                              datetime.now().strftime("%S"),
-                                              datetime.now().strftime("%f"))
+                                              datetime.now().strftime("%M"))
 
     log_dir = "{}/trained/{}/log".format(scratch_dir, saved_file)
 
@@ -221,7 +205,6 @@ def train(args):
     optimizerDM = optim.Adam(discriminator_m.parameters(), lr=disc_lr, betas=(beta1, beta2))
 
     epochs = args.n_epochs
-    #loss_lst = []
 
     w_sparse = w_sparse.to(device)
     b = b.to(device)
@@ -229,16 +212,11 @@ def train(args):
 
     for e in range(epochs):
 
-        t_epoch0 = time.time()
-
         for x in loader:
-            # t20 = time.time()
-            # print("Time consumed before epoch 0 since training started: ", t20 - t0)
             it_counts += 1
             # Train D
-            # print("Loaded batch size: ", x.size())
             x1 = x[:, :, :(channels//2)+1, :, :].reshape(batch_size, time_steps, channels, x_height, x_width).to(device)
-            if (args.stx_method == "skw") | (args.stx_method == "tdc") | (args.stx_method == "tdc_masked"):
+            if (stx_method == "skw") | (stx_method == "tdc") | (stx_method == "tdc_masked"):
                 x2 = x[:, 1:, (channels//2)+1:, :, :].reshape(batch_size, time_steps - 1, channels, x_height, x_width).to(device)
             else:
                 x2 = x[:, :, (channels//2)+1:, :, :].reshape(batch_size, time_steps, channels, x_height, x_width).to(device)
@@ -254,17 +232,13 @@ def train(args):
             fake_data = generator(z, y).reshape(batch_size_half, time_steps, channels, x_height, x_width)
             fake_data_p = generator(z_p, y_p).reshape(batch_size_half, time_steps, channels, x_height, x_width)
 
-            if args.embedding_op == "moran":
+            if embedding_op == "moran":
                 fake_data_emb = make_mis(fake_data, w_sparse)#[:, 1:, :, :, :]
                 fake_data_p_emb = make_mis(fake_data_p, w_sparse)#[:, 1:, :, :, :]
-            elif args.embedding_op == "spate":
-                if (args.stx_method == "skw") | (args.stx_method == "tdc") | (args.stx_method == "tdc_masked"):
-                    # t30 = time.time()
-
+            elif embedding_op == "spate":
+                if (stx_method == "skw") | (stx_method == "tdc") | (stx_method == "tdc_masked"):
                     fake_data_emb = make_spates(fake_data, w_sparse, b, stx_method, u, theta1=theta1, theta2=theta2)[:, 1:, :, :, :]
                     fake_data_p_emb = make_spates(fake_data_p, w_sparse, b, stx_method, u, theta1=theta1, theta2=theta2)[:, 1:, :, :, :]
-                    # t31 = time.time()
-                    # print("Time consumed during make_spates() for fake data for training D: ", t31 - t30)
                 else:
                     fake_data_emb = make_spates(fake_data, w_sparse, b, stx_method, theta1=theta1, theta2=theta2)#[:, 1:, :, :, :]
                     fake_data_p_emb = make_spates(fake_data_p, w_sparse, b, stx_method, theta1=theta1, theta2=theta2)#[:, 1:, :, :, :]
@@ -273,7 +247,7 @@ def train(args):
                 fake_data_p_emb = None
 
             if fake_data_emb is not None:
-                if (args.stx_method == "skw") | (args.stx_method == "tdc") | (args.stx_method == "tdc_masked"):
+                if (stx_method == "skw") | (stx_method == "tdc") | (stx_method == "tdc_masked"):
                   real_emb = torch.cat((torch.unsqueeze(real_data[:, 0, :, :, :], 1), real_data_emb), 1)
                   fake_emb = torch.cat((torch.unsqueeze(fake_data[:, 0, :, :, :], 1), fake_data_emb), 1)
                 else:
@@ -288,7 +262,7 @@ def train(args):
                     loss_d = original_sinkhorn_loss(concat_real, concat_fake, sinkhorn_eps, sinkhorn_l, scale=scale)
                     disc_loss = -loss_d
                 else:
-                    if (args.stx_method == "skw") | (args.stx_method == "tdc") | (args.stx_method == "tdc_masked"):
+                    if (stx_method == "skw") | (stx_method == "tdc") | (stx_method == "tdc_masked"):
                         real_emb_p = torch.cat((torch.unsqueeze(real_data_p[:, 0, :, :, :], 1), real_data_p_emb), 1)
                         fake_emb_p = torch.cat((torch.unsqueeze(fake_data_p[:, 0, :, :, :], 1), fake_data_p_emb), 1)
                     else:
@@ -335,29 +309,21 @@ def train(args):
                     real_data_p = real_data_p.reshape(batch_size_half, time_steps, -1)
                     fake_data_p = fake_data_p.reshape(batch_size_half, time_steps, -1)
 
-                    # t60 = time.time()
                     loss_d = compute_mixed_sinkhorn_loss(real_data, fake_data, m_real, m_fake, h_fake,
                                                          sinkhorn_eps, sinkhorn_l, real_data_p, fake_data_p,
                                                          m_real_p, h_real_p, h_fake_p, scale=scale)
 
                     pm1 = scale_invariante_martingale_regularization(m_real, reg_penalty, scale=scale)
                     disc_loss = -loss_d + pm1
-                    # t61 = time.time()
-                    # print('Time consumed during compute_mixed_sinkhorn_loss() for D is: ', t61-t60)
 
             # torch.autograd.set_detect_anomaly(True)
 
             # updating Discriminators
-            # t60 = time.time()
-
             discriminator_h.zero_grad()
             discriminator_m.zero_grad()
             disc_loss.backward()
             optimizerDH.step()
             optimizerDM.step()
-
-            # t61 = time.time()
-            # print('Time consumed during updating D is: ', t61-t60)
 
             # Train G
             z = torch.randn(batch_size_half, time_steps, z_height * z_width).to(device)
@@ -367,18 +333,14 @@ def train(args):
 
             fake_data = generator(z, y).reshape(batch_size_half, time_steps, channels, x_height, x_width)
             fake_data_p = generator(z_p, y_p).reshape(batch_size_half, time_steps, channels, x_height, x_width)
-            # print("Outside: input size", x1.size(), "output_size", fake_data.size())
 
-            if args.embedding_op == "moran":
+            if embedding_op == "moran":
                 fake_data_emb = make_mis(fake_data, w_sparse)#[:, 1:, :, :, :]
                 fake_data_p_emb = make_mis(fake_data_p, w_sparse)#[:, 1:, :, :, :]
-            elif args.embedding_op == "spate":
-                if (args.stx_method == "skw") | (args.stx_method == "tdc") | (args.stx_method == "tdc_masked"):   # merge with 'tdc'
-                    # t40 = time.time()
+            elif embedding_op == "spate":
+                if (stx_method == "skw") | (stx_method == "tdc") | (stx_method == "tdc_masked"):   # merge with 'tdc'
                     fake_data_emb = make_spates(fake_data, w_sparse, b, stx_method, u, theta1=theta1, theta2=theta2)[:, 1:, :, :, :]
                     fake_data_p_emb = make_spates(fake_data_p, w_sparse, b, stx_method, u, theta1=theta1, theta2=theta2)[:, 1:, :, :, :]
-                    # t41 = time.time()
-                    # print("Time consumed during make_spates() for fake data for training G: ", t41 - t40)
                 else:
                     fake_data_emb = make_spates(fake_data, w_sparse, b, stx_method, theta1=theta1, theta2=theta2)#[:, 1:, :, :, :]
                     fake_data_p_emb = make_spates(fake_data_p, w_sparse, b, stx_method, theta1=theta1, theta2=theta2)#[:, 1:, :, :, :]
@@ -387,7 +349,7 @@ def train(args):
                 fake_data_p_emb = None
 
             if fake_data_emb is not None:
-                if (args.stx_method == "skw") | (args.stx_method == "tdc") | (args.stx_method == "tdc_masked"):
+                if (stx_method == "skw") | (stx_method == "tdc") | (stx_method == "tdc_masked"):
                     real_emb = torch.cat((torch.unsqueeze(real_data[:, 0, :, :, :], 1), real_data_emb), 1)
                     fake_emb = torch.cat((torch.unsqueeze(fake_data[:, 0, :, :, :], 1), fake_data_emb), 1)
                 else:
@@ -401,7 +363,7 @@ def train(args):
                     concat_fake = concat_fake.reshape(batch_size_half, time_steps, -1)
                     loss_g = original_sinkhorn_loss(concat_real, concat_fake, sinkhorn_eps, sinkhorn_l, scale=scale)
                 else:
-                    if (args.stx_method == "skw") | (args.stx_method == "tdc") | (args.stx_method == "tdc_masked"):
+                    if (stx_method == "skw") | (stx_method == "tdc") | (stx_method == "tdc_masked"):
                         real_emb_p = torch.cat((torch.unsqueeze(real_data_p[:, 0, :, :, :], 1), real_data_p_emb), 1)
                         fake_emb_p = torch.cat((torch.unsqueeze(fake_data_p[:, 0, :, :, :], 1), fake_data_p_emb), 1)
                     else:
@@ -418,12 +380,9 @@ def train(args):
                     h_fake_p, h_fake_p_emb = discriminator_h(concat_fake_p, concat_fake)
                     m_real_p, m_real_p_emb = discriminator_m(concat_real_p, concat_real)
 
-                    # t50 = time.time()
                     loss_g = compute_mixed_sinkhorn_loss(concat_real, concat_fake, m_real, m_fake, h_fake,
                                                          sinkhorn_eps, sinkhorn_l, concat_real_p, concat_fake_p,
                                                          m_real_p, h_real_p, h_fake_p, scale=scale)
-                    # t51 = time.time()
-                    # print('Time consumed during compute_mixed_sinkhorn_loss() for G is: ', t51-t50)
             else:
                 if args.loss_func == "sinkhorngan":
                     real_data = real_data.reshape(batch_size_half, time_steps, -1)
@@ -449,25 +408,19 @@ def train(args):
                                                          sinkhorn_eps, sinkhorn_l, real_data_p, fake_data_p,
                                                          m_real_p, h_real_p, h_fake_p, scale=scale)
             gen_loss = loss_g
-            #loss_lst.append(gen_loss)
 
             # updating Generator
-            # t60 = time.time()
-
             generator.zero_grad()
             gen_loss.backward()
             optimizerG.step()
             # it.set_postfix(loss=float(gen_loss))
             # it.update(1)
 
-            # t61 = time.time()
-            # print('Time consumed during updating G is: ', t61-t60)
-
             # ...log the running loss
             writer.add_scalar('Sinkhorn training loss', gen_loss, it_counts)
             if args.loss_func == "cotgan":
                 writer.add_scalar('pM for real', pm1, it_counts)
-                if not args.embedding_op == "none":
+                if not embedding_op == "none":
                     writer.add_scalar('pM for embedding', pm2, it_counts)
                 writer.flush()
 
@@ -480,19 +433,12 @@ def train(args):
                 break
             else:
                 if it_counts % save_freq == 0 or it_counts == 1:
-                    print("Epoch [%d/%d] - Generator Loss: %f - Discriminator Loss: %f" % (
-                    e, epochs, gen_loss.item(), disc_loss.item()))
+                    print("\nEpoch [%d/%d] - Iter [%d/%d] - Generator Loss: %f - Discriminator Loss: %f" % (
+                    e, epochs, it_counts%(dataset.data.size(0)//batch_size), dataset.data.size(0)//batch_size, gen_loss.item(), disc_loss.item()))
                     z = torch.randn(batch_size_half, time_steps, z_height * z_width).to(device)
                     y = torch.randn(batch_size_half, y_dim).to(device)
                     samples = generator(z, y)
-                    # plot first 5 samples within one image
-                    '''
-                    plot1 = torch.squeeze(samples[0]).permute(1, 0, 2)
-                    plt.figure()
-                    plt.imshow(plot1.reshape([x_height, 10 * x_width]).detach().numpy())
-                    plt.show()
-                    '''
-                    # print(samples.shape)
+
                     n_show = min(batch_size_half, 5)
                     samples = samples[:n_show, :, 0, :, :].permute(0, 2, 1, 3)
                     img = samples.reshape(1, n_show * x_height, time_steps * x_width)
@@ -509,8 +455,6 @@ def train(args):
                     print("Saved all models to {}".format(save_path))
             continue
 
-        t_epoch1 = time.time()
-        # print(f"Time consumed during epoch {e} is: ", t_epoch1 - t_epoch0)
     writer.close()
 
 

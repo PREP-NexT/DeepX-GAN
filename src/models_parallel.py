@@ -17,7 +17,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 class VideoDCD(nn.Module):
     '''
-    Discriminator for H or M
+        Discriminator for H or M
+    
     Args:
         inputs: (numpy array) real time series data (x_1, x_2,...,x_T) and fake samples (y_1, y_2,...,y_T) as inputs
         to the model has shape [batch_size, x_height, x_weight*time_step, channel]
@@ -130,7 +131,8 @@ class VideoDCD(nn.Module):
 
 class VideoDCG(nn.Module):
     '''
-    Discriminator for H or M
+        Discriminator for H or M
+    
     Args:
         inputs: (numpy array) real time series data (x_1, x_2,...,x_T) and fake samples (y_1, y_2,...,y_T) as inputs
         to the model has shape [batch_size, x_height, x_weight*time_step, channel]

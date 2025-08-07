@@ -16,7 +16,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 def cost_matrix(x, y, p=2, scale=False):
     '''
-    L2 distance between vectors, using expanding and hence is more memory intensive
+        L2 distance between vectors, using expanding and hence is more memory intensive
+    
     :param x: x is tensor of shape [batch_size, time steps, features]
     :param y: y is tensor of shape [batch_size, time steps, features]
     :param p: power
@@ -34,11 +35,13 @@ def cost_matrix(x, y, p=2, scale=False):
 
 def modified_cost(x, y, h, M, scale=False):
     '''
+        Compute the modified cost matrix for the Sinkhorn algorithm.
+
     :param x: a tensor of shape [batch_size, time steps, features]
     :param y: a tensor of shape [batch_size, time steps, features]
     :param h: a tensor of shape [batch size, time steps, J]
     :param M: a tensor of shape [batch size, time steps, J]
-    :param scaling_coef: a scaling coefficient for squared distance between x and y
+    :param scale: a scaling coefficient for squared distance between x and y
     :return: L1 cost matrix plus h, M modification:
     a matrix of size [batch_size, batch_size] where
     c_hM_{ij} = c_hM(x^i, y^j) = L2_cost + \sum_{t=1}^{T-1}h_t\Delta_{t+1}M
@@ -125,7 +128,8 @@ def compute_sinkhorn(x, y, h, M, epsilon=0.1, niter=10, scale=False, benchmark=F
 
 def scale_invariante_martingale_regularization(M, reg_lam, scale=False):
     '''
-    Compute the regularization for the martingale condition (i.e. p_M).
+        Compute the regularization for the martingale condition (i.e. p_M).
+
     :param M: a tensor of shape (batch_size, sequence length), the output of an RNN applied to X
     :param reg_lam: scale parameter for first term in pM
     :return: A rank 0 tensors (i.e. scalers)
@@ -153,6 +157,8 @@ def scale_invariante_martingale_regularization(M, reg_lam, scale=False):
 def compute_mixed_sinkhorn_loss(f_real, f_fake, m_real, m_fake, h_fake, sinkhorn_eps, sinkhorn_l,
                                 f_real_p, f_fake_p, m_real_p, h_real_p, h_fake_p, scale=False):
     '''
+        Compute the mixed Sinkhorn loss.
+    
     :param x and x'(f_real, f_real_p): real data of shape [batch size, time steps, features]
     :param y and y'(f_fake, f_fake_p): fake data of shape [batch size, time steps, features]
     :param h and h'(h_real, h_fake): h(y) of shape [batch size, time steps, J]
@@ -178,11 +184,13 @@ def compute_mixed_sinkhorn_loss(f_real, f_fake, m_real, m_fake, h_fake, sinkhorn
 def compute_classic_sinkhorn_loss(f_real, f_fake, m_real, m_fake, h_fake, h_real, sinkhorn_eps,
                                   sinkhorn_l, scale=False):
     '''
+        Compute the classic Sinkhorn loss.
+    
     :param x and x'(f_real, f_real_p): real data of shape [batch size, time steps, features]
     :param y and y'(f_fake, f_fake_p): fake data of shape [batch size, time steps, features]
     :param h and h'(h_real, h_fake): h(y) of shape [batch size, time steps, J]
     :param m and m'(m_real and m_fake): M(x) of shape [batch size, time steps, J]
-    :param scaling_coef: a scaling coefficient
+    :param scale: a scaling coefficient
     :param sinkhorn_eps: Sinkhorn parameter - epsilon
     :param sinkhorn_l: Sinkhorn parameter - the number of iterations
     :return: final Sinkhorn loss(and actual number of sinkhorn iterations for monitoring the training process)
@@ -199,9 +207,11 @@ def compute_classic_sinkhorn_loss(f_real, f_fake, m_real, m_fake, h_fake, h_real
 
 def original_sinkhorn_loss(x, y, sinkhorn_eps, sinkhorn_l, scale=False):
     '''
+        Compute the original Sinkhorn loss.
+
     :param x: real data of shape [batch size, time steps, features]
     :param y: fake data of shape [batch size, time steps, features]
-    :param scaling_coef: a scaling coefficient
+    :param scale: a scaling coefficient
     :param sinkhorn_eps: Sinkhorn parameter - epsilon
     :param sinkhorn_l: Sinkhorn parameter - the number of iterations
     :return: final Sinkhorn loss(and actual number of sinkhorn iterations for monitoring the training process)
