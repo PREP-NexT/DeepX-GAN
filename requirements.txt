@@ -1,0 +1,27 @@
+# DeepX-GAN — Dependencies
+# =========================
+# Install with:  pip install -r requirements.txt
+#
+# Tested with Python 3.9 / 3.10 on Linux (CUDA 11.8 / 12.1).
+
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Scientific computing
+numpy>=1.23.0
+scipy>=1.10.0
+pandas>=1.5.0
+
+# NetCDF / climate data
+xarray>=2023.1.0
+netCDF4>=1.6.0
+
+# Spatial statistics (for queen-contiguity weight matrix)
+libpysal>=4.7.0
+
+# Image processing (used only for optional cv2 utilities; can be removed)
+opencv-python>=4.7.0
+
+# TensorBoard for training visualisation
+tensorboard>=2.13.0

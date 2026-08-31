@@ -1,225 +1,334 @@
-import os
-import json
-import argparse
-import time
-from datetime import datetime
+"""
+gan_utils.py — GAN loss functions for DeepX-GAN
+==================================================
+This module implements the **Causal Optimal Transport GAN (COT-GAN)** loss
+(Xu et al. 2020) used to train DeepX-GAN.
 
-import cv2
+The COT-GAN objective extends the classical Sinkhorn divergence with a
+martingale-aware cost function that respects the causal (temporal) structure
+of the data.  The key building blocks are:
+
+1. **Sinkhorn algorithm**: An efficient approximation to the Wasserstein-1
+   optimal transport cost via entropy regularisation.
+
+2. **Modified cost function**: The pairwise transport cost between two
+   trajectories is augmented with a term involving the discriminator outputs
+   h (from D_H) and M (from D_M), capturing the causal dependence structure.
+
+3. **Martingale regularisation** (p_M): An auxiliary penalty that encourages
+   the discriminator output M to satisfy the discrete martingale condition,
+   which is required for the theoretical guarantees of COT-GAN.
+
+Reference
+---------
+Xu, T., et al. (2020). "COT-GAN: Generating Sequential Data via Causal
+Optimal Transport." NeurIPS 2020.
+
+"""
+
+import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, IterableDataset, DataLoader
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.autograd import Variable
-from torch.utils.tensorboard import SummaryWriter
 
-def cost_matrix(x, y, p=2, scale=False):
-    '''
-        L2 distance between vectors, using expanding and hence is more memory intensive
-    
-    :param x: x is tensor of shape [batch_size, time steps, features]
-    :param y: y is tensor of shape [batch_size, time steps, features]
-    :param p: power
-    :return: cost matrix: a matrix of size [batch_size, batch_size] where
-    '''
+
+# ---------------------------------------------------------------------------
+# Pairwise cost matrices
+# ---------------------------------------------------------------------------
+
+def cost_matrix(x: torch.Tensor, y: torch.Tensor, p: int = 2, scale: bool = False) -> torch.Tensor:
+    """
+    Compute the L^p pairwise cost matrix between two batches of trajectories.
+
+    Each entry C[i, j] is the sum of p-th powers of element-wise absolute
+    differences between trajectory i in ``x`` and trajectory j in ``y``,
+    accumulated over all time steps and features::
+
+        C[i, j] = Σ_t ||x_i(t) - y_j(t)||^p
+
+    Parameters
+    ----------
+    x : torch.Tensor, shape (N, T, F)
+        Batch of N trajectories of length T with feature dimension F.
+    y : torch.Tensor, shape (M, T, F)
+        Batch of M trajectories.
+    p : int
+        Power of the Lp norm.  Default is p=2 (squared Euclidean).
+    scale : bool
+        If ``True``, divide the cost by the number of time steps T to make
+        the loss independent of sequence length.
+
+    Returns
+    -------
+    torch.Tensor of shape (N, M)
+    """
+    # Broadcasting: x_col is (N, 1, T, F), y_lin is (1, M, T, F)
     x_col = x.unsqueeze(1)
     y_lin = y.unsqueeze(0)
-    time_steps = x.shape[1]
-    b = torch.sum((torch.abs(x_col - y_lin)) ** p, -1)
-    c = torch.sum(b, -1)
+    T = x.shape[1]
+    # Sum over features first, then over time steps
+    b = torch.sum(torch.abs(x_col - y_lin) ** p, dim=-1)   # (N, M, T)
+    c = torch.sum(b, dim=-1)                                 # (N, M)
     if scale:
-        c /= time_steps
+        c = c / T
     return c
 
 
-def modified_cost(x, y, h, M, scale=False):
-    '''
-        Compute the modified cost matrix for the Sinkhorn algorithm.
-
-    :param x: a tensor of shape [batch_size, time steps, features]
-    :param y: a tensor of shape [batch_size, time steps, features]
-    :param h: a tensor of shape [batch size, time steps, J]
-    :param M: a tensor of shape [batch size, time steps, J]
-    :param scale: a scaling coefficient for squared distance between x and y
-    :return: L1 cost matrix plus h, M modification:
-    a matrix of size [batch_size, batch_size] where
-    c_hM_{ij} = c_hM(x^i, y^j) = L2_cost + \sum_{t=1}^{T-1}h_t\Delta_{t+1}M
-    ====> NOTE: T-1 here, T = # of time steps
-    '''
-    # compute sum_{t=1}^{T-1} h[t]*(M[t+1]-M[t])
-    DeltaMt = M[:, 1:, :] - M[:, :-1, :]
-    ht = h[:, :-1, :]
-    time_steps = ht.shape[1]
-    sum_over_j = torch.sum(ht[:, None, :, :] * DeltaMt[None, :, :, :], -1)
-    C_hM = torch.sum(sum_over_j, -1)
-    if scale:
-        C_hM /= time_steps
-
-    # Compute L2 cost $\sum_t^T |x^i_t - y^j_t|^2$
-    cost_xy = cost_matrix(x, y, scale=scale)
-
-    return cost_xy + C_hM
-
-
-def compute_sinkhorn(x, y, h, M, epsilon=0.1, niter=10, scale=False, benchmark=False):
+def modified_cost(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    h: torch.Tensor,
+    M: torch.Tensor,
+    scale: bool = False,
+) -> torch.Tensor:
     """
-    Given two emprical measures with n points each with locations x and y
-    outputs an approximation of the OT cost with regularization parameter epsilon
-    niter is the max. number of steps in sinkhorn loop
+    Compute the **martingale-aware modified cost** used in COT-GAN.
+
+    The cost between trajectory x_i and trajectory y_j is::
+
+        C_hM(x_i, y_j) = L²(x_i, y_j) + Σ_{t=1}^{T−1} h_i(t) · ΔM_j(t+1)
+
+    where ΔM_j(t) = M_j(t) − M_j(t−1) is the increment of the discriminator
+    output M along trajectory j, and h_i(t) is the discriminator output H for
+    trajectory i.  This coupling term captures the causal structure by making
+    the cost sensitive to how the marginals evolve over time.
+
+    Parameters
+    ----------
+    x : torch.Tensor, shape (N, T, F)
+        Real trajectories.
+    y : torch.Tensor, shape (M, T, F)
+        Fake (generated) trajectories.
+    h : torch.Tensor, shape (N, T, J)
+        Discriminator H output for the batch of trajectories.
+    M : torch.Tensor, shape (M, T, J)
+        Discriminator M output for the batch of trajectories.
+    scale : bool
+        Divide by T−1 for length-independent loss.
+
+    Returns
+    -------
+    torch.Tensor of shape (N, M)
+        Modified pairwise cost matrix.
+    """
+    # Martingale increments of M along the sequence: shape (M, T-1, J)
+    DeltaMt = M[:, 1:, :] - M[:, :-1, :]
+    ht = h[:, :-1, :]          # h at all but the last time step: (N, T-1, J)
+    T_minus1 = ht.shape[1]
+
+    # Cross-term: h_i(t) · ΔM_j(t);  broadcasting over the two batch dimensions
+    # ht[:, None]: (N, 1, T-1, J),  DeltaMt[None, :]: (1, M, T-1, J)
+    sum_over_j = torch.sum(ht[:, None, :, :] * DeltaMt[None, :, :, :], dim=-1)  # (N, M, T-1)
+    C_hM = torch.sum(sum_over_j, dim=-1)   # (N, M)
+    if scale:
+        C_hM = C_hM / T_minus1
+
+    return cost_matrix(x, y, scale=scale) + C_hM
+
+
+# ---------------------------------------------------------------------------
+# Sinkhorn algorithm
+# ---------------------------------------------------------------------------
+
+def compute_sinkhorn(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    h: torch.Tensor,
+    M: torch.Tensor,
+    epsilon: float = 0.1,
+    niter: int = 10,
+    scale: bool = False,
+    benchmark: bool = False,
+) -> torch.Tensor:
+    """
+    Compute the Sinkhorn divergence between two empirical distributions.
+
+    Uses the log-domain Sinkhorn algorithm with Nesterov-like acceleration for
+    numerical stability.  The entropy-regularised OT cost is::
+
+        OT_ε(μ, ν) = min_{π ∈ Π(μ,ν)} <C, π> + ε KL(π | μ⊗ν)
+
+    Parameters
+    ----------
+    x : torch.Tensor, shape (N, T, F)
+        Samples from distribution μ (e.g. real data).
+    y : torch.Tensor, shape (N, T, F)
+        Samples from distribution ν (e.g. generated data).
+    h : torch.Tensor, shape (N, T, J)
+        Discriminator H output (used in the modified cost).
+    M : torch.Tensor, shape (N, T, J)
+        Discriminator M output (used in the modified cost).
+    epsilon : float
+        Entropy regularisation coefficient.  Smaller values give a closer
+        approximation to true OT but may be less stable.
+    niter : int
+        Maximum number of Sinkhorn iterations.
+    scale : bool
+        Divide costs by T.
+    benchmark : bool
+        If ``True``, use the standard L² cost (no h, M modification); useful
+        for computing the SinkhornGAN baseline.
+
+    Returns
+    -------
+    torch.Tensor (scalar)
+        Sinkhorn transport cost.
     """
     n = x.shape[0]
 
-    # The Sinkhorn algorithm takes as input three variables :
+    # Build the pairwise cost matrix
     if benchmark:
-        C = cost_matrix(x, y, scale=scale)
+        C = cost_matrix(x, y, scale=scale)               # standard L² cost
     else:
-        C = modified_cost(x, y, h, M, scale=scale) # shape: [batch_size, batch_size]
+        C = modified_cost(x, y, h, M, scale=scale)        # COT-GAN modified cost
 
+    # Uniform marginals (equal weight to every sample)
+    mu = torch.ones(n, requires_grad=False, device=x.device) / n
+    nu = torch.ones(n, requires_grad=False, device=x.device) / n
 
-    # both marginals are fixed with equal weights
-    # mu = Variable(1. / n * torch.cuda.FloatTensor(n).fill_(1), requires_grad=False)
-    # nu = Variable(1. / n * torch.cuda.FloatTensor(n).fill_(1), requires_grad=False)
-    mu = 1. / n * torch.ones(n, requires_grad=False, device=x.device)
-    nu = 1. / n * torch.ones(n, requires_grad=False, device=x.device)
+    # Sinkhorn acceleration parameters
+    tau = -0.8     # Nesterov extrapolation coefficient
 
-    # Parameters of the Sinkhorn algorithm.
-    rho = 1  # (.5) **2          # unbalanced transport
-    tau = -.8  # nesterov-like acceleration
-    lam = rho / (rho + epsilon)  # Update exponent
-    thresh = 10**(-4)  # stopping criterion
-
-    # Elementary operations .....................................................................
-    def ave(u, u1):
-        "Barycenter subroutine, used by kinetic acceleration through extrapolation."
-        return tau * u + (1 - tau) * u1
-
-    def M(u, v):
-        "Modified cost for logarithmic updates"
-        "$M_{ij} = (-c_{ij} + u_i + v_j) / \epsilon$"
+    # Helper closures for the log-domain Sinkhorn iterations
+    def M_fn(u, v):
+        """Log-domain modified cost: (-C + u_i + v_j) / ε"""
         return (-C + u.unsqueeze(1) + v.unsqueeze(0)) / epsilon
 
     def lse(A):
-        "log-sum-exp"
-        return torch.logsumexp(A, dim=-1, keepdim=True)  # add 10^-6 to prevent NaN
+        """Log-sum-exp over the last dimension."""
+        return torch.logsumexp(A, dim=-1, keepdim=True)
 
-    # Actual Sinkhorn loop ......................................................................
-    u, v, err = 0. * mu, 0. * nu, 0.
-    actual_nits = 0  # to check if algorithm terminates because of threshold or max iterations reached
+    def ave(u, u1):
+        """Nesterov extrapolation (barycentric update)."""
+        return tau * u + (1 - tau) * u1
 
-    for i in range(niter):
-        u1 = u  # useful to check the update
-        u = epsilon * (torch.log(mu) - lse(M(u, v)).squeeze()) + u
-        v = epsilon * (torch.log(nu) - lse(M(u, v).t()).squeeze()) + v
-        # accelerated unbalanced iterations
-        # u = ave( u, lam * ( epsilon * ( torch.log(mu) - lse(M(u,v)).squeeze()   ) + u ) )
-        # v = ave( v, lam * ( epsilon * ( torch.log(nu) - lse(M(u,v).t()).squeeze() ) + v ) )
-        err = (u - u1).abs().sum()
+    # Initialise dual variables
+    u = torch.zeros_like(mu)
+    v = torch.zeros_like(nu)
+    thresh = 1e-4    # convergence tolerance
 
-        actual_nits += 1
-        if (err < thresh).item():
+    for _ in range(niter):
+        u_prev = u
+        u = epsilon * (torch.log(mu) - lse(M_fn(u, v)).squeeze()) + u
+        v = epsilon * (torch.log(nu) - lse(M_fn(u, v).t()).squeeze()) + v
+        err = (u - u_prev).abs().sum()
+        if err.item() < thresh:
             break
-    U, V = u, v
-    pi = torch.exp(M(U, V))  # Transport plan pi = diag(a)*K*diag(b)
-    cost = torch.sum(pi * C)  # Sinkhorn cost
 
+    # Recover the optimal transport plan and compute the primal cost
+    pi = torch.exp(M_fn(u, v))        # (N, N) transport plan
+    cost = torch.sum(pi * C)
     return cost
 
 
-def scale_invariante_martingale_regularization(M, reg_lam, scale=False):
-    '''
-        Compute the regularization for the martingale condition (i.e. p_M).
+# ---------------------------------------------------------------------------
+# Martingale regularisation
+# ---------------------------------------------------------------------------
 
-    :param M: a tensor of shape (batch_size, sequence length), the output of an RNN applied to X
-    :param reg_lam: scale parameter for first term in pM
-    :return: A rank 0 tensors (i.e. scalers)
-    This tensor represents the martingale penalization term denoted $p_M$
-    '''
+def scale_invariante_martingale_regularization(
+    M: torch.Tensor, reg_lam: float, scale: bool = False
+) -> torch.Tensor:
+    """
+    Compute the martingale regularisation penalty p_M.
+
+    p_M penalises the discriminator output M for deviating from the martingale
+    condition (i.e. E[M(t+1) | history] = M(t)).  Specifically, it encourages
+    the *mean* increment ΔM across the batch to be zero at every time step::
+
+        p_M = reg_lam * Σ_t |  (1/N) Σ_i ΔM_i(t) / std(M) |
+
+    Parameters
+    ----------
+    M : torch.Tensor, shape (N, T, J)
+        Discriminator M output for a batch of N trajectories.
+    reg_lam : float
+        Scaling coefficient for the martingale penalty.
+    scale : bool
+        Divide by T.
+
+    Returns
+    -------
+    torch.Tensor (scalar)
+        Martingale penalty p_M.
+    """
     m, t, j = M.shape
-    # m = torch.tensor(m).type(torch.FloatTensor)
-    # t = torch.tensor(m).type(torch.FloatTensor)
-    # compute delta M matrix N
-    N = M[:, 1:, :] - M[:, :-1, :]
-    N_std = N / (torch.std(M, (0, 1)) + 1e-06)
+    N = M[:, 1:, :] - M[:, :-1, :]                       # increments: (N, T-1, J)
+    N_std = N / (torch.std(M, dim=(0, 1)) + 1e-6)         # standardised increments
 
-    # Compute \sum_i^m(\delta M)
-    sum_m_std = torch.sum(N_std, 0) / m
-    # Compute martingale penalty: P_M1 =  \sum_i^T(|\sum_i^m(\delta M)|) * scaling_coef
+    # Mean increment across batch: shape (T-1, J)
+    sum_m_std = torch.sum(N_std, dim=0) / m
+
+    # Sum of absolute mean increments across time and feature dimensions
     sum_across_paths = torch.sum(torch.abs(sum_m_std))
     if scale:
-        sum_across_paths /= t
+        sum_across_paths = sum_across_paths / t
 
-    # the total pM term
-    pm = reg_lam * sum_across_paths
-    return pm
+    return reg_lam * sum_across_paths
 
 
-def compute_mixed_sinkhorn_loss(f_real, f_fake, m_real, m_fake, h_fake, sinkhorn_eps, sinkhorn_l,
-                                f_real_p, f_fake_p, m_real_p, h_real_p, h_fake_p, scale=False):
-    '''
-        Compute the mixed Sinkhorn loss.
-    
-    :param x and x'(f_real, f_real_p): real data of shape [batch size, time steps, features]
-    :param y and y'(f_fake, f_fake_p): fake data of shape [batch size, time steps, features]
-    :param h and h'(h_real, h_fake): h(y) of shape [batch size, time steps, J]
-    :param m and m'(m_real and m_fake): M(x) of shape [batch size, time steps, J]
-    :param scaling_coef: a scaling coefficient
-    :param sinkhorn_eps: Sinkhorn parameter - epsilon
-    :param sinkhorn_l: Sinkhorn parameter - the number of iterations
-    :return: final Sinkhorn loss(and actual number of sinkhorn iterations for monitoring the training process)
-    '''
-    f_real = f_real.reshape(f_real.shape[0], f_real.shape[1], -1)
-    f_fake = f_fake.reshape(f_fake.shape[0], f_fake.shape[1], -1)
+# ---------------------------------------------------------------------------
+# Combined COT-GAN loss (mixed Sinkhorn)
+# ---------------------------------------------------------------------------
+
+def compute_mixed_sinkhorn_loss(
+    f_real: torch.Tensor,
+    f_fake: torch.Tensor,
+    m_real: torch.Tensor,
+    m_fake: torch.Tensor,
+    h_fake: torch.Tensor,
+    sinkhorn_eps: float,
+    sinkhorn_l: int,
+    f_real_p: torch.Tensor,
+    f_fake_p: torch.Tensor,
+    m_real_p: torch.Tensor,
+    h_real_p: torch.Tensor,
+    h_fake_p: torch.Tensor,
+    scale: bool = False,
+) -> torch.Tensor:
+    """
+    Compute the **mixed Sinkhorn COT-GAN loss**.
+
+    The loss is an unbiased estimator of the squared Cauchy-Sinkhorn distance::
+
+        L = S(x, y) + S(x', y') - S(x, x') - S(y, y')
+
+    where x, x' are two independent real batches and y, y' are two independent
+    generated batches.  This mixed formulation reduces variance compared to the
+    naïve ``2*S(x,y) - S(x,x') - S(y,y')``.
+
+    Parameters
+    ----------
+    f_real, f_real_p : torch.Tensor, shape (N, T, F)
+        Two independent real data batches (x and x').
+    f_fake, f_fake_p : torch.Tensor, shape (N, T, F)
+        Two independent generated data batches (y and y').
+    m_real, m_real_p : torch.Tensor, shape (N, T, J)
+        Discriminator M output for real batches (x and x').
+    m_fake : torch.Tensor, shape (N, T, J)
+        Discriminator M output for generated batch y.
+    h_fake, h_fake_p : torch.Tensor, shape (N, T, J)
+        Discriminator H output for generated batches y and y'.
+    h_real_p : torch.Tensor, shape (N, T, J)
+        Discriminator H output for real batch x'.
+    sinkhorn_eps : float
+        Sinkhorn epsilon regularisation.
+    sinkhorn_l : int
+        Number of Sinkhorn iterations.
+    scale : bool
+        Divide costs by T.
+
+    Returns
+    -------
+    torch.Tensor (scalar)
+        Mixed Sinkhorn COT-GAN loss.
+    """
+    # Flatten spatial dimensions into features for Sinkhorn
+    f_real   = f_real.reshape(f_real.shape[0], f_real.shape[1], -1)
+    f_fake   = f_fake.reshape(f_fake.shape[0], f_fake.shape[1], -1)
     f_real_p = f_real_p.reshape(f_real_p.shape[0], f_real_p.shape[1], -1)
     f_fake_p = f_fake_p.reshape(f_fake_p.shape[0], f_fake_p.shape[1], -1)
-    loss_xy = compute_sinkhorn(f_real, f_fake, h_fake, m_real, sinkhorn_eps, sinkhorn_l, scale=scale)
+
+    loss_xy  = compute_sinkhorn(f_real,   f_fake,   h_fake,   m_real,   sinkhorn_eps, sinkhorn_l, scale=scale)
     loss_xyp = compute_sinkhorn(f_real_p, f_fake_p, h_fake_p, m_real_p, sinkhorn_eps, sinkhorn_l, scale=scale)
-    loss_xx = compute_sinkhorn(f_real, f_real_p, h_real_p, m_real, sinkhorn_eps, sinkhorn_l, scale=scale)
-    loss_yy = compute_sinkhorn(f_fake, f_fake_p, h_fake_p, m_fake, sinkhorn_eps, sinkhorn_l, scale=scale)
+    loss_xx  = compute_sinkhorn(f_real,   f_real_p, h_real_p, m_real,   sinkhorn_eps, sinkhorn_l, scale=scale)
+    loss_yy  = compute_sinkhorn(f_fake,   f_fake_p, h_fake_p, m_fake,   sinkhorn_eps, sinkhorn_l, scale=scale)
 
-    loss = loss_xy + loss_xyp - loss_xx - loss_yy
-    return loss
-
-
-def compute_classic_sinkhorn_loss(f_real, f_fake, m_real, m_fake, h_fake, h_real, sinkhorn_eps,
-                                  sinkhorn_l, scale=False):
-    '''
-        Compute the classic Sinkhorn loss.
-    
-    :param x and x'(f_real, f_real_p): real data of shape [batch size, time steps, features]
-    :param y and y'(f_fake, f_fake_p): fake data of shape [batch size, time steps, features]
-    :param h and h'(h_real, h_fake): h(y) of shape [batch size, time steps, J]
-    :param m and m'(m_real and m_fake): M(x) of shape [batch size, time steps, J]
-    :param scale: a scaling coefficient
-    :param sinkhorn_eps: Sinkhorn parameter - epsilon
-    :param sinkhorn_l: Sinkhorn parameter - the number of iterations
-    :return: final Sinkhorn loss(and actual number of sinkhorn iterations for monitoring the training process)
-    '''
-    f_real = f_real.reshape(f_real.shape[0], f_real.shape[1], -1)
-    f_fake = f_fake.reshape(f_fake.shape[0], f_fake.shape[1], -1)
-    loss_xy = compute_sinkhorn(f_real, f_fake, h_fake, m_real, sinkhorn_eps, sinkhorn_l, scale=scale)
-    loss_xx = compute_sinkhorn(f_real, f_real, h_real, m_real, sinkhorn_eps, sinkhorn_l, scale=scale)
-    loss_yy = compute_sinkhorn(f_fake, f_fake, h_fake, m_fake, sinkhorn_eps, sinkhorn_l, scale=scale)
-
-    loss = 2.0 * loss_xy - loss_xx - loss_yy
-    return loss
-
-
-def original_sinkhorn_loss(x, y, sinkhorn_eps, sinkhorn_l, scale=False):
-    '''
-        Compute the original Sinkhorn loss.
-
-    :param x: real data of shape [batch size, time steps, features]
-    :param y: fake data of shape [batch size, time steps, features]
-    :param scale: a scaling coefficient
-    :param sinkhorn_eps: Sinkhorn parameter - epsilon
-    :param sinkhorn_l: Sinkhorn parameter - the number of iterations
-    :return: final Sinkhorn loss(and actual number of sinkhorn iterations for monitoring the training process)
-    '''
-    loss_xy = compute_sinkhorn(x, y, sinkhorn_eps, sinkhorn_l, scale=scale, benchmark=True)
-    loss_xx = compute_sinkhorn(x, x, sinkhorn_eps, sinkhorn_l, scale=scale, benchmark=True)
-    loss_yy = compute_sinkhorn(y, y, sinkhorn_eps, sinkhorn_l, scale=scale, benchmark=True)
-
-    loss = 2.0 * loss_xy - loss_xx - loss_yy
-
-    return loss
+    return loss_xy + loss_xyp - loss_xx - loss_yy

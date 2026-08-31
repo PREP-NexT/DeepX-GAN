@@ -1,76 +1,148 @@
 # DeepX-GAN
-The code repo for the paper "Capturing Unseen Spatial Extremes Through Knowledge-Informed Generative Modeling" (not officially published yet). A preprint of this manuscript is available at [arXiv: 2507.09211](https://arxiv.org/abs/2507.09211). 
 
-This repository is still under active development. Please note that the code has not been fully documented or annotated yet. We are sharing this version to accompany our manuscript and to promote transparency and reproducibility. Variable names and function structures may change, and detailed comments are still being added. Future updates will include improved documentation and cleaner structure.
+The code repository for the paper **"Capturing Unseen Spatial Heat Extremes Through Dependence-Aware Generative Modeling"**.  
+A preprint is available at [arXiv: 2507.09211](https://arxiv.org/abs/2507.09211).
 
+---
+
+## Method overview
+
+**DeepX-GAN** (**D**ependence-**E**nhanced **E**mbedding for **P**hysical e**X**tremes - **G**enerative **A**dversarial **N**etwork) explicitly incorporates extremal dependence structures in climate fields. We infuse the knowledge of spatial tail dependence structures into the deep generative model by embedding a novel **DeepX** (**D**ependence-**E**nhanced **E**mbedding for **P**hysical e**X**tremes) metric, which identifies evolving patterns across space and time while explicitly accounting for the spatial correlation of extreme events. It ensures the generated sequences are closely aligned with real data in a transformed space where extremal spatiotemporal patterns are easier to learn. The embedding metric is fused with real (or generated) data along the channel dimension. When minimizing the embedding loss, the generator is optimized to reconstruct the spatial tail dependence structure observed in the real dataset. This integration enables DeepX-GAN to gain insight into the collective behaviors of spatial extreme events, facilitating more reliable simulation of spatially compounding events crucial for risk assessment.
+
+---
 
 ## Data
-The example dataset is shared on Google Drive due to GitHub's file size limit: 
-- lgcp (Log-Gaussian Cox Process) [link](https://drive.google.com/file/d/1uWmAV_UhnjZkc6govwxVxhFRN2uPK-_u/view?usp=sharing).
-- tmax (daily maximum temperature) [link](https://drive.google.com/file/d/1jWOCox6btoBEMG6vLkh_Qv_YUZuSSJ9f/view?usp=sharing).
 
-These datasets need to be downloaded to "DATA" folder under the project path.
+The example dataset (ERA5 daily maximum 2-m temperature for the MENA region) [link](https://drive.google.com/file/d/1agxGISWhy1zEz_efa7uxoIW_ct4402or/view?usp=sharing) is required to run the code. It is shared on Google Drive due to GitHub's file size limit and needs to be placed in the `DATA/` directory one level above this folder (i.e. `../DATA/`):
 
+| File | Description |
+|------|-------------|
+| `era5.reanalysis.t2m.daymax.32x64.1979-2014.MENA.ncep_t62.nc` | ERA5 t2m daily max, 1979–2014, MENA (32 × 64 grid) |
+
+---
 
 ## Environment
-To reproduce the Python environment, use the provided Conda environment file `deepx-gan_ENV.yml`:
+
+To reproduce the Python environment, install the dependencies with pip:
+
 ```bash
-conda env create -f deepx-gan_ENV.yml
+pip install -r requirements.txt
 ```
 
-This will create a new environment with all required dependencies.
+Requires Python ≥ 3.9 and PyTorch ≥ 2.0. GPU training is strongly recommended.
 
+---
 
 ## Code structure
-- `main_parallel.py`: the entry point to configure and start training.
-- `train_parallel.py`: defines the training process.
-- `models_parallel.py`: defines the model architecture.
-- `data_utils.py`: handles data loading and preprocessing.
-    > **Note**: The code expects datasets to be stored in the `/DATA/` directory. Please ensure you download and place the datasets in the correct location.
-- `gan_utils.py`: contains the loss functions used for training.
-- `spatial_utils.py`: implements the computation of the DeepX spatial dependence metric.
 
+| File | Description |
+|------|-------------|
+| `main.py` | Entry point — parse arguments and launch training |
+| `train.py` | Training loop |
+| `models.py` | Generator (`VideoDCG`) and Discriminator (`VideoDCD`) |
+| `spatial_utils.py` | DeepX embedding computation |
+| `gan_utils.py` | Sinkhorn loss and martingale regularisation |
+| `data_utils.py` | Climate data loading and seasonal preprocessing |
+| `requirements.txt` | Python dependencies |
+
+> **Note**: The code expects datasets to be stored in the `../DATA/` directory relative to this folder.
+
+---
 
 ## Get started
+
 ### Running the model
-You can configure all relevant hyperparameters either by modifying `main_parallel.py` directly or by passing arguments via the command line. For example:
+
+You can configure all relevant hyperparameters either by modifying `main.py` directly or by passing arguments via the command line. For example:
+
 ```bash
-python main_parallel.py -d tmax -ne 1000
+python main.py --dname era5-t2m-daymax --n_epochs 1000
 ```
 
-This will start training the model with `tmax` as the target data and `1000` training epochs.
+This will start training the model on ERA5 daily maximum temperature data for 1000 epochs.
 
-### Parallel GPU training
-The code is designed for parallel training on multiple GPUs. Please ensure you configure the following hyperparameters in `main_parallel.py`:
-- `parallel_ids`: a list specifying the GPU device IDs to use in parallel (e.g., `[0, 1]`).
-- `cuda_num`: the ID of the main GPU that handles model aggregation and loss computation.
+**Quick debug run** (64 samples, verifies everything runs end-to-end):
 
-Make sure the specified GPUs are available on your machine.
+```bash
+python main.py --debug_run True --n_epochs 10 --save_freq 5
+```
+
+**Resume from checkpoint**:
+
+```bash
+python main.py \
+    --pre_trained_path ./trained/<run_name>/ckpts \
+    --iter_final <checkpoint_iteration>
+```
+
+### Adding a new dataset
+
+Add an entry to the `DATASET_REGISTRY` dictionary in `data_utils.py`:
+
+```python
+DATASET_REGISTRY = {
+    'era5-t2m-daymax': { ... },   # existing
+    'my-new-dataset': {
+        'filename':    'my_data.nc',
+        'nc_var':      'variable_name',
+        'time_dim':    'time',
+        'description': 'Short description',
+    },
+}
+```
+
+No other code changes are needed — pass `--dname my-new-dataset` on the command line.
+
+---
 
 ## Expected output
-The log file and trained models will be stored in `/trained/run_name/`, where `run_name` is automatically created using the training dataset, training method, date, and time information.
 
-The generator and discriminator losses will be output in the terminal and stored in a log file, which could be retrieved in a tensorboard by:
+Trained model checkpoints and TensorBoard logs are stored in `../trained/<run_name>/`, where `run_name` is automatically created from the dataset name, embedding method, date, and time (e.g. `20260101_2045_era5-t2m-daymax-tdc_masked`).
+
+A structured JSON configuration file (`train_notes.json`) is saved alongside the checkpoints for reproducibility.
+
+To visualise training losses:
+
 ```bash
-tensorboard --logdir=log
+tensorboard --logdir ../trained/<run_name>/log
 ```
 
-Then go to the URL it provides for visualization OR to http://localhost:6006/.
+Then open the URL shown in the terminal or go to http://localhost:6006/.
 
-## Warnings
-During training, you may encounter the following ignorable warnings:
-```
-UserWarning: geopandas not available. Some functionality will be disabled.
-  warn("geopandas not available. Some functionality will be disabled.")
-```
-which usually comes from packages like `xarray` or `cartopy` that can optionally use geopandas for geographic features, and
-```
-UserWarning: RNN module weights are not part of single contiguous chunk of memory. This means they need to be compacted at every call, possibly greatly increasing memory usage. To compact weights again call flatten_parameters().
-```
-which commonly happens when using `nn.DataParallel` as a performance warning.
+---
+
+## Key hyperparameters
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dname` | `era5-t2m-daymax` | Dataset name (key in `DATASET_REGISTRY`) |
+| `--stx_method` | `tdc_masked` | DeepX metric variant (`tdc_masked`, `tdc`, `skw`) |
+| `--u` | `0.7` | Quantile threshold for extremes (top 30%) |
+| `--time_steps` | `30` | Days per sequence window |
+| `--batch_size` | `32` | Training batch size |
+| `--n_epochs` | `50000` | Total training epochs |
+| `--sinkhorn_eps` | `0.8` | Sinkhorn regularisation ε |
+| `--reg_penalty` | `1.5` | Martingale penalty coefficient λ |
+| `--save_freq` | `100` | Checkpoint interval (iterations) |
+| `--cuda_num` | `0` | GPU device index |
+
+---
 
 ## Reproducibility & performance
-The code has been tested for reproducibility on **Ubuntu 20.04** using **two NVIDIA RTX A6000 GPUs**. However, it should be compatible with other operating systems and GPU models, provided that your Python environment is correctly configured. 
 
-- **Environment setup**: Creating the Conda environment typically takes about **10–20 minutes**.
-- **Training speed**: On the above setup, training takes approximately **4.5 seconds per iteration** with a batch size of `32` and the dataset `tmax`.
+The code has been tested on **Ubuntu 20.04** using **NVIDIA RTX A6000 GPUs**.  It should be compatible with other operating systems and GPU models, provided the Python environment is correctly configured.
+
+---
+
+## Citation
+
+If you use this code, please cite our paper.
+
+
+---
+
+## Acknowledgements
+
+This work builds on the SPATE-GAN framework (Klemmer et al. 2022).  ERA5 data were obtained from the Copernicus Climate Change Service.
+
+

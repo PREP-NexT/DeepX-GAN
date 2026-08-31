@@ -1,374 +1,542 @@
+"""
+spatial_utils.py — Spatial embedding utilities for DeepX-GAN
+==============================================================
+This module implements the **DeepX** embedding used
+as an auxiliary channel in the GAN discriminator.
+
+DeepX is a modification of SPATE (Zellner et al. 2022) that replaces the
+classical Kulldorff space-time expectation with an extreme-value-aware version
+based on the empirical upper tail-dependence coefficient (TDC).  This makes the
+discriminator explicitly sensitive to co-occurring spatial extremes, which is
+the key novelty of this paper.
+
+Mathematical background
+-----------------------
+Given a spatiotemporal field  x[h, w, t]  (height × width × time), DeepX
+proceeds in three steps:
+
+1. **Tail dependence weights**:  For each pair of grid cells (i, j), estimate
+   the probability that both cells are simultaneously above their respective
+   ``u``-th quantile.  This yields a symmetric weight matrix TDC[i, j].
+
+2. **Space-time expectation**:  For each cell i and time t, compute a weighted
+   space-time expected value  E_i(t) that combines the TDC weights with an
+   exponential temporal decay.
+
+3. **Local Moran's I (SPATE statistic)**:  Compute the local spatial
+   autocorrelation  MI_i(t) between the observed field and the expectation,
+   using a first-order queen-contiguity spatial weight matrix.
+
+The ``tdc_masked`` variant additionally masks the expectation by the joint
+exceedance indicator, down-weighting non-extreme time steps.
+
+Reference
+---------
+[Paper citation here]
+"""
+
 import torch
-import scipy.sparse
-import numpy as np
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
+import numpy as np
+import scipy.sparse
 from libpysal.weights import lat2W
-import pandas as pd
 
 
-def crs_to_torch_sparse(x):
+# ---------------------------------------------------------------------------
+# Sparse matrix utilities
+# ---------------------------------------------------------------------------
+
+def crs_to_torch_sparse(x: scipy.sparse.csr_matrix) -> torch.Tensor:
     """
-        Convert sparse scipy matrix to torch sparse tensor.
-    
-    :param x: crs matrix (scipy sparse matrix)
-    :return: weight matrix as torch sparse tensor
+    Convert a SciPy CSR sparse matrix to a PyTorch sparse FloatTensor.
+
+    Parameters
+    ----------
+    x : scipy.sparse.csr_matrix
+        Input sparse matrix.
+
+    Returns
+    -------
+    torch.sparse.FloatTensor
     """
     x = x.tocoo()
-    values = x.data
-    indices = np.vstack((x.row, x.col))
-    i = torch.LongTensor(indices)
-    v = torch.FloatTensor(values)
-    shape = x.shape
-    return torch.sparse.FloatTensor(i, v, torch.Size(shape))
+    indices = torch.LongTensor(np.vstack((x.row, x.col)))
+    values = torch.FloatTensor(x.data)
+    return torch.sparse.FloatTensor(indices, values, torch.Size(x.shape))
 
 
-def make_sparse_weight_matrix(h, w, rook=False):
+def make_sparse_weight_matrix(h: int, w: int, rook: bool = False) -> torch.Tensor:
     """
-        Create a spatial weight matrix using libpysal's lat2W function.
-        
-    :param h: height of the matrix
-    :param w: width of the matrix
-    :param rook: whether to use rook weights or not
-    :return: w = weight matrix as torch sparse tensor
+    Build the binary queen (or rook) contiguity spatial weight matrix for an
+    h × w regular grid and return it as a PyTorch sparse tensor.
+
+    Queen contiguity (default) assigns weight 1 to all eight neighbours
+    (including diagonals); rook contiguity assigns weight 1 only to the four
+    orthogonal neighbours.
+
+    Parameters
+    ----------
+    h : int
+        Number of rows (latitude grid cells).
+    w : int
+        Number of columns (longitude grid cells).
+    rook : bool
+        If ``True``, use rook contiguity; otherwise use queen contiguity.
+
+    Returns
+    -------
+    torch.sparse.FloatTensor of shape (h*w, h*w)
     """
-    w = lat2W(h, w, rook=rook)      # For rook, the neighboring pixels are weight 1's; for queen, the neighboring
-                                    # (including clinodiagonal) pixels are weight 1's.
-    return crs_to_torch_sparse(w.sparse)
+    W = lat2W(h, w, rook=rook)
+    return crs_to_torch_sparse(W.sparse)
 
 
-def temporal_weights(n,b):
+# ---------------------------------------------------------------------------
+# Temporal decay weights
+# ---------------------------------------------------------------------------
+
+def temporal_weights(n: int, b: float) -> torch.Tensor:
     """
-        Compute temporal distance weight tensor.
-        
-    :param n: number of time steps
-    :param b: parameter governing exponential weight decay
-    :return: weights = temporal weights tensor of shape [1, 1, n-1]
+    Compute exponentially decaying temporal weights for a window of n time steps.
+
+    The weight for lag τ (looking backward from the current time step) is::
+
+        w(τ) = exp(−τ / b),   τ = 1, …, n−1
+
+    arranged so that the most recent lag (τ = 1) appears last in the tensor.
+
+    Parameters
+    ----------
+    n : int
+        Number of time steps.
+    b : float
+        Temporal decay parameter; larger ``b`` means slower decay (more memory).
+
+    Returns
+    -------
+    torch.Tensor of shape (1, 1, n−1)
     """
-    weights = torch.exp(-torch.arange(1,n).flip(0) / b).view(1,1,-1)
-    return weights
+    return torch.exp(-torch.arange(1, n).flip(0) / b).view(1, 1, -1)
 
 
-def get_tdc(a, u=0.8, correct_diag=True):
+# ---------------------------------------------------------------------------
+# Upper tail dependence coefficient (TDC)
+# ---------------------------------------------------------------------------
+
+def get_tdc(a: torch.Tensor, u: float = 0.8, correct_diag: bool = True) -> torch.Tensor:
     """
-        Pytorch version to compute tail dependence coefficient matrix, vectorized by matrix multiplication
+    Estimate the empirical upper tail-dependence coefficient (TDC) matrix.
 
-    :param a: [height*width, n_frames], torch.tensor
-    :param u: threshold, default=0.8
-    :param correct_diag: to ensure diag=1
-    :return: probs - torch.tensor, tail dependence coefficient matrix,
-                    symmetric [height*width, height*width]
+    For each pair of grid cells (i, j), TDC[i, j] estimates the conditional
+    probability that cell j is above its u-th quantile given that cell i is
+    above its u-th quantile::
+
+        TDC[i, j] ≈ P(X_j > Q_j(u) | X_i > Q_i(u))
+                   = P(X_i > Q_i(u), X_j > Q_j(u)) / (1 − u)
+
+    The computation is vectorised via matrix multiplication for efficiency.
+
+    Parameters
+    ----------
+    a : torch.Tensor, shape (n_time, n_cells)
+        Flattened spatiotemporal field; each column is one grid cell's time series.
+    u : float
+        Quantile threshold (e.g. 0.8 means top-20 % extremes).
+    correct_diag : bool
+        Force diagonal to 1 (a cell is perfectly dependent with itself).
+
+    Returns
+    -------
+    torch.Tensor of shape (n_cells, n_cells)
+        Symmetric TDC weight matrix.
     """
     n, hw = a.shape
-    in_tail = a > torch.quantile(a, q=u, dim=0)
-    ## list comprehension
-    # probs = [in_tail[in_tail[:, i], j].sum()/(n*(1-u)) for i in range(hw) for j in range(hw)]
-    # probs = torch.stack(probs).reshape(hw, hw)
-    ## vectorization
-    probs = torch.matmul(in_tail.t().type(torch.float), in_tail.type(torch.float))
-    probs = probs/(n*(1-u))
+    # Boolean indicator: True where cell value exceeds its u-th quantile at that time step
+    in_tail = a > torch.quantile(a, q=u, dim=0)   # (n_time, n_cells)
+
+    # Count simultaneous exceedances for each cell pair (vectorised dot product)
+    probs = torch.matmul(in_tail.t().float(), in_tail.float())  # (n_cells, n_cells)
+    probs = probs / (n * (1 - u))
+
     if correct_diag:
-        probs.fill_diagonal_(1)
+        probs.fill_diagonal_(1.0)
     return probs
 
 
-def paired_multiply(mat):
+def get_weights_tdc(x: torch.Tensor, u: float = 0.8) -> torch.Tensor:
     """
-        Obtain the multiplication between any two elements of a 2-D matrix. If the original matrix is [h, w], this multiplication will result in a [h*w, h*w] symmetric matrix,
-    with each row being [xn*x1, xn*x2, xn*x3, ...].
+    Compute the TDC weight matrix for a single spatiotemporal field.
 
-    :param mat: matrix to be conducted. torch.tensor
-    :return: mat_aug: Augmented matrix.
+    Parameters
+    ----------
+    x : torch.Tensor, shape (H, W, T)
+        A single spatiotemporal sequence (height × width × time steps).
+    u : float
+        Quantile threshold for extreme identification.
+
+    Returns
+    -------
+    torch.Tensor of shape (H, W, H*W)
+        TDC weights reshaped for use in the space-time expectation.
+    """
+    h, w, n = x.shape
+    # Reshape to (T, H*W) so each column is one cell's time series
+    x_flat = x.reshape(h * w, n).permute(1, 0)   # (T, H*W)
+    weights_tdc = get_tdc(x_flat, u, correct_diag=True)   # (H*W, H*W)
+    return weights_tdc.reshape(h, w, h * w)
+
+
+def paired_multiply(mat: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the outer product of a flattened 2-D matrix with itself.
+
+    For an H × W boolean mask, this returns an (H*W × H*W) matrix where
+    entry [i, j] = mask_flat[i] * mask_flat[j], i.e. 1 iff both cells are in
+    the extreme tail at this time step.
+
+    Parameters
+    ----------
+    mat : torch.Tensor, shape (H, W)
+        2-D mask (typically a boolean or float extreme indicator).
+
+    Returns
+    -------
+    torch.Tensor of shape (H*W, H*W)
     """
     h, w = mat.shape
-    mat_long = torch.reshape(mat, (h*w, 1))
-    mat_rep = mat_long.repeat(1, h*w)
-    mat_aug = torch.mul(mat_rep.type(torch.float), mat_rep.t().type(torch.float))
-    return mat_aug
+    mat_flat = mat.reshape(h * w, 1).float()
+    return torch.mul(mat_flat, mat_flat.t())   # outer product
 
 
-def get_weights_tdc(x, u=0.8):
+def get_weights_tdc_masked(x: torch.Tensor, u: float = 0.8) -> torch.Tensor:
     """
-        Compute the tail dependence coefficient (TDC) matrix
+    Compute the TDC weight matrix masked by the joint exceedance indicator.
 
-    :param x: [height, width, n_frames], torch.tensor (n_frames = n_time_steps ?)
-    :param u: threshold, default=0.8
-    :return: weights_tdc [height, width, height*width]
-    """
-    h, w, n = x.shape
-    x = torch.reshape(x, (h*w, n)).permute(1, 0)
-    weights_tdc = get_tdc(x, u, correct_diag=True)
-    weights_tdc = torch.reshape(weights_tdc, (h, w, h*w))
-    # print("weights_tdc.is_cuda: ", weights_tdc.is_cuda)  # the output should be cuda (i.e.,GPU) if GPU is enabled
-    # print("x.is_cuda: ", x.is_cuda)
-    return weights_tdc
+    Unlike ``get_weights_tdc``, each time step receives its own masked weight:
+    the TDC coefficient between cells i and j at time t is zeroed out unless
+    *both* cells exceed their respective u-th quantile at time t.  This focuses
+    the embedding strictly on time steps that are jointly extreme.
 
+    Parameters
+    ----------
+    x : torch.Tensor, shape (H, W, T)
+        Spatiotemporal sequence.
+    u : float
+        Quantile threshold.
 
-def get_weights_tdc_masked(x, u=0.8):
-    """
-        mask weights_tdc by (x_it > percentile(x_i{t}, u)) & (x_jt > percentile(x_j{t}, u))
-
-    :param x: [height, width, n_frames], torch.tensor (n_frames = n_time_steps ?)
-    :param u: the percentile threshold for extremes 
-    :return: weights_tdc_masked [height, width, height*width, n_time_steps]
+    Returns
+    -------
+    torch.Tensor of shape (H, W, H*W, T)
+        Time-varying masked TDC weights.
     """
     h, w, n = x.shape
 
-    ## Compute the mask for weights_tdc (test whether both elements > percentile)
-    mask_ele = x > torch.quantile(x, u, dim=2, keepdim=True)  ## torch.quantile: [height, width, 1], mask_ele: [height, width, n_ts]
-    mask_paired = [paired_multiply(mask_ele[:, :, t]) for t in range(0, n)]   
-    mask_paired = torch.stack(mask_paired)   ## mask_paired after stack: [n, h*w, h*w]
-    ## Compute weights_tdc as usual
-    x = torch.reshape(x, (h*w, n)).permute(1, 0)
-    weights_tdc = get_tdc(x, u, correct_diag=True)  ## weights_tdc: [h*w, h*w]
-    ## Mask weights_tdc
-    weights_tdc_masked = torch.mul(weights_tdc, mask_paired)   ## broadcast automatically
-    ## Reshape similar to that without mask
-    weights_tdc_masked = weights_tdc_masked.permute(1, 2, 0)
-    weights_tdc_masked = torch.reshape(weights_tdc_masked, (h, w, h*w, n))
-    return weights_tdc_masked  ## [height, width, height*width, n_time_steps]
+    # Boolean mask: True where each cell exceeds its own u-th quantile at each time step
+    # Shape: (H, W, T)
+    mask_ele = x > torch.quantile(x, u, dim=2, keepdim=True)
 
-## mask_paired_sp = mask_paired.to_sparse()
+    # Build the outer-product mask for every time step: shape (T, H*W, H*W)
+    mask_paired = torch.stack([paired_multiply(mask_ele[:, :, t]) for t in range(n)])
+
+    # Global TDC matrix (time-averaged)
+    x_flat = x.reshape(h * w, n).permute(1, 0)   # (T, H*W)
+    weights_tdc = get_tdc(x_flat, u, correct_diag=True)   # (H*W, H*W)
+
+    # Mask by joint exceedance: broadcast (H*W, H*W) against (T, H*W, H*W)
+    weights_tdc_masked = weights_tdc * mask_paired          # (T, H*W, H*W)
+
+    # Reshape to (H, W, H*W, T)  for use in st_ex_tdc
+    weights_tdc_masked = weights_tdc_masked.permute(1, 2, 0)          # (H*W, H*W, T)
+    weights_tdc_masked = weights_tdc_masked.reshape(h, w, h * w, n)
+    return weights_tdc_masked
 
 
-def st_ex_tdc(x, weights, weights_tdc, mask_on=False):
+# ---------------------------------------------------------------------------
+# Space-time expectation functions
+# ---------------------------------------------------------------------------
+
+def st_ex_tdc(x: torch.Tensor, weights: torch.Tensor, weights_tdc, mask_on: bool = False) -> torch.Tensor:
     """
-        Space-time expectations using the tail dependence coefficient (TDC) matrix, vectorized by matrix multiplication.
-    
-    :param x: input video of shape [height, width, n_frames]
-    :param weights: tensor of distance weights of shape [1, 1, time_steps] (Can be computed via temporal_weights())
-    :param weights_tdc: tail dependence coefficient [height, width, height*width]
-    :param mask_on: whether to use the mask for TDC
-    :return: exp_val = expected values;
-             shape [height, width, n_frames-1]
+    Compute the DeepX space-time expectation using TDC weights.
+
+    For each grid cell i and time step t, the expected value is::
+
+        E_i(t) = [Σ_{τ<t} w(t-τ) * x_i(τ)] *
+                 [Σ_j TDC(i,j) * x_j(t)] /
+                 [Σ_{τ<t} w(t-τ) * x_i(τ)]   (integrated over space j)
+
+    When ``mask_on=True`` (the ``tdc_masked`` method), the second factor uses
+    the time-varying masked TDC weights so that only jointly extreme time steps
+    contribute.
+
+    Parameters
+    ----------
+    x : torch.Tensor, shape (H, W, T)
+        Spatiotemporal sequence.
+    weights : torch.Tensor, shape (1, 1, T−1)
+        Exponential temporal decay weights (from ``temporal_weights()``).
+    weights_tdc : torch.Tensor
+        TDC weight tensor.  Shape (H, W, H*W) for ``mask_on=False``;
+        shape (H, W, H*W, T) for ``mask_on=True``.
+    mask_on : bool
+        If ``True``, use the time-varying masked TDC weights.
+
+    Returns
+    -------
+    torch.Tensor of shape (H, W, T−1)
+        DeepX space-time expectation for each cell and time step.
     """
     h, w, n = x.shape
-    # first term
+
     if mask_on:
-        # x_aug = x.reshape(h,w,1,n)
-        # term1 = [(weights_tdc[:, :, i, t] * x_aug[:, :, 0, t]).reshape(-1).sum() for i in range(h*w) for t in range(1, n)]
-
-        weights_tdc_resize = weights_tdc.view(h*w, h*w, n)
-        x_resize = x.reshape(h*w, n)
-        term1 = [torch.matmul(weights_tdc_resize[:, :, t].t(), x_resize[:, 1:])[:, t-1] for t in range(1, n)]
-        term1 = torch.stack(term1).t()
+        # weights_tdc shape: (H, W, H*W, T) → reshape to (H*W, H*W, T)
+        weights_tdc_resize = weights_tdc.view(h * w, h * w, n)
+        x_resize = x.view(h * w, n)   # (H*W, T)
+        # For each t, compute Σ_j TDC_masked(i,j,t) * x_j(t) for all cells i
+        # Result is a list of (H*W,) vectors for t=1,...,T-1
+        term1 = [torch.matmul(weights_tdc_resize[:, :, t].t(), x_resize[:, 1:])[:, t - 1]
+                 for t in range(1, n)]
+        term1 = torch.stack(term1).t()   # (H*W, T-1)
     else:
-        # term1 = [(weights_tdc[:, :, i] * x[:, :, t]).reshape(-1).sum() for i in range(h*w) for t in range(1, n)]
-        term1 = torch.matmul(weights_tdc.view(h*w, -1).t(), x.view(h*w, n)[:, 1:])  ## whichever is the first matrix need to be transposed, this is because the view/reshape puts the original [h,w] dimension to the h*w length column.
+        # weights_tdc shape: (H, W, H*W) → (H*W, H*W) after view + transpose
+        # term1[i, t] = Σ_j TDC(i, j) * x_j(t+1),  shape (H*W, T-1)
+        term1 = torch.matmul(weights_tdc.view(h * w, -1).t(), x.view(h * w, n)[:, 1:])
 
-    # term1 = torch.stack(term1).reshape(h*w, n-1)        # [height*width, n_frames-1]
-    exp_val = [(weights[:, :, -t:] * x[:, :, :t]).sum(dim=2).reshape(-1) *
-               term1[:, t-1] / (weights[:, :, -t:] * x[:, :, :t]).reshape(-1).sum() for t in range(1, n)]
+    # Temporal component: weighted average of past values, shape (H*W, 1) for each t
+    exp_val = [
+        (weights[:, :, -t:] * x[:, :, :t]).sum(dim=2).reshape(-1) *
+        term1[:, t - 1] /
+        (weights[:, :, -t:] * x[:, :, :t]).reshape(-1).sum()
+        for t in range(1, n)
+    ]
     exp_val = torch.stack(exp_val).permute(1, 0).reshape(h, w, n - 1)
     return exp_val
 
 
-def handle_tuple_err(G):
+def st_ex(x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """
-    (optional) Handle errors related to tuple attributes in the neural network layers.
+    Classic sequential space-time expectation (original SPATE, no TDC).
 
-    :param G: Generator model
-    :return: G with handled tuple attributes
-    """
-    if hasattr(G, 'deconv_net'):
-        for i in range(len(G.deconv_net)):
-            if hasattr(G.deconv_net[i], 'kernel_size'):
-                G.deconv_net[i].kernel_size = tuple(G.deconv_net[i].kernel_size)
-            if hasattr(G.deconv_net[i], 'stride'):
-                G.deconv_net[i].stride = tuple(G.deconv_net[i].stride)
-            if hasattr(G.deconv_net[i], 'padding'):
-                G.deconv_net[i].padding = tuple(G.deconv_net[i].padding)
-    if hasattr(G, 'conv_net'):
-        for i in range(len(G.conv_net)):
-            if hasattr(G.conv_net[i], 'kernel_size'):
-                G.conv_net[i].kernel_size = tuple(G.conv_net[i].kernel_size)
-            if hasattr(G.conv_net[i], 'stride'):
-                G.conv_net[i].stride = tuple(G.conv_net[i].stride)
-            if hasattr(G.conv_net[i], 'padding'):
-                G.conv_net[i].padding = tuple(G.conv_net[i].padding)
-    return G
+    This is the baseline expectation assuming spatial and temporal independence::
 
+        E_i(t) = [Σ_{τ<t} w(t-τ) * x_i(τ)] * Σ_j x_j(t) /
+                 [Σ_{τ<t} w(t-τ) * x_i(τ)]   (integrated over all cells j)
 
-def st_ex(x, weights):
-    """
-        Space-time expectations (assuming temporal order to suit sequentiality constraints)
-    
-    :param x: input video of shape [height, width, n_frames]
-    :param weights: tensor of distance weights of shape [1, 1, time_steps] (Can be computed via temporal_weights())
-    :return: exp_val = expected values assuming space-time independence and sequential calculation;
-             shape [height, width, n_frames-1]
+    Parameters
+    ----------
+    x : torch.Tensor, shape (H, W, T)
+    weights : torch.Tensor, shape (1, 1, T−1)
+
+    Returns
+    -------
+    torch.Tensor of shape (H, W, T−1)
     """
     h, w, n = x.shape
-    exp_val = [(weights[:, :, -t:] * x[:, :, :t]).sum(dim=2).reshape(-1) * x[:, :, t].reshape(-1).sum() / (weights[:, :, -t:] * x[:, :, :t]).reshape(-1).sum() for t in range(1, n)]
-    exp_val = torch.stack(exp_val).permute(1, 0).reshape(h, w, n - 1)
-    return exp_val
+    exp_val = [
+        (weights[:, :, -t:] * x[:, :, :t]).sum(dim=2).reshape(-1) *
+        x[:, :, t].reshape(-1).sum() /
+        (weights[:, :, -t:] * x[:, :, :t]).reshape(-1).sum()
+        for t in range(1, n)
+    ]
+    return torch.stack(exp_val).permute(1, 0).reshape(h, w, n - 1)
 
 
-def st_ex_kulldorff(x):
+# ---------------------------------------------------------------------------
+# Local Moran's I helper
+# ---------------------------------------------------------------------------
+
+def mi_mean(x: torch.Tensor, x_mean: torch.Tensor, w_sparse: torch.Tensor) -> torch.Tensor:
     """
-        Space-time expectations; as proposed by Kulldorff, 2005 (assuming knowledge of the whole time series; no temporal weights)
-        
-    :param x: input video of shape [height, width, n_frames]
-    :return: exp_val = expected values assuming space-time independence and sequential calculation;
-             shape [height, width, n_frames-1]
-    """
-    h, w, n = x.shape
-    s_ex = torch.stack([x[:, :, t].reshape(-1).sum() for t in range(0, n)])
-    t_ex = x.sum(dim=2)
-    exp_val = torch.einsum('ab,c->abc', (t_ex, s_ex)) / x.reshape(-1).sum()
-    return exp_val
+    Compute local Moran's I with a custom (externally provided) mean.
 
+    Local Moran's I quantifies how similar a cell's deviation from expectation
+    is to its spatial neighbours' deviations::
 
-def st_ex_kulldorff_weighted(x, weights):
-    """
-        Space-time expectations; as proposed by Kulldorff, 2005 (assuming knowledge of the whole time series; including temporal weights)
-    
-    :param x: input video of shape [height, width, n_frames]
-    :param weights: tensor of distance weights of shape [1, 1, time_steps] (Can be computed via temporal_weights())
-    :return: exp_val = expected values assuming space-time independence and sequential calculation;
-             shape [height, width, n_frames-1]
-    """
-    h, w, n = x.shape
-    exp_val = torch.stack([x[:, :, t].reshape(-1).sum() * (x * weights[t,...].reshape(1, 1, -1)).sum(dim=2) / (x * weights[t,...].reshape(1,1,-1)).reshape(-1).sum() for t in range(0,n)]).permute(1,2,0)
-    return exp_val
+        MI_i = (n−1) * z_i * Σ_j w_{ij} z_j / Σ_i z_i²
 
+    where  z_i = (x_i − x_mean_i) / std(x).
 
-def mi_mean(x, x_mean, w_sparse):
-    """
-        Local Moran's I with custom means
+    Parameters
+    ----------
+    x : torch.Tensor, shape (H*W,) or (H, W)
+        Observed field (will be flattened).
+    x_mean : torch.Tensor, shape (H*W,)
+        Expected value used as the local mean (replaces the global mean).
+    w_sparse : torch.Tensor (sparse), shape (H*W, H*W)
+        Spatial weight matrix.
 
-    :param x: input data tensor (flattened or image)
-    :param x_mean: input tensor of same (flattened) shape as x
-    :param w_sparse: spatial weight matrix; torch sparse tensor 
-    :return: mi = output data - local Moran's I
+    Returns
+    -------
+    torch.Tensor of shape (H*W,)
+        Local Moran's I for each grid cell.
     """
     x = x.reshape(-1)
+    x_mean = x_mean.reshape(-1)
     n = len(x)
-    n_1 = n - 1
     z = x - x_mean
     sx = x.std()
-    z /= sx
+    z = z / sx
     den = (z * z).sum()
+    # Spatially lagged z: Σ_j w_{ij} z_j
     zl = torch.sparse.mm(w_sparse, z.reshape(-1, 1)).reshape(-1)
-    mi = n_1 * z * zl / den
-    return mi
+    return (n - 1) * z * zl / den
 
 
-def mi(x, w_sparse):
+# ---------------------------------------------------------------------------
+# Per-sample SPATE / DeepX computation
+# ---------------------------------------------------------------------------
+
+def spate(
+    x: torch.Tensor,
+    w_sparse: torch.Tensor,
+    b: torch.Tensor,
+    method: str = "tdc_masked",
+    b_tdc=None,
+) -> torch.Tensor:
     """
-        Local Moran's I
-    
-    :param x: input data tensor (flattened or image)
-    :param w_sparse: spatial weight matrix; torch sparse tensor
-    :return: mi = output data - local Moran's I    
-    """
-    x = x.reshape(-1)
-    n = len(x)
-    n_1 = n - 1
-    z = x - x.mean()
-    sx = x.std()
-    z /= sx
-    den = (z * z).sum()
-    zl = torch.sparse.mm(w_sparse, z.reshape(-1, 1)).reshape(-1)
-    mi = n_1 * z * zl / den
-    return mi
+    Compute SPATE or DeepX for a single spatiotemporal sequence.
 
+    Parameters
+    ----------
+    x : torch.Tensor, shape (H, W, T)
+        Single spatiotemporal field (one sample, one channel).
+    w_sparse : torch.Tensor (sparse), shape (H*W, H*W)
+        Queen-contiguity spatial weight matrix.
+    b : torch.Tensor, shape (1, 1, T−1)
+        Temporal decay weights.
+    method : str
+        Embedding method.  Options:
+        - ``'tdc'``        : DeepX with time-averaged TDC weights.
+        - ``'tdc_masked'`` : DeepX with time-varying masked TDC weights
+                             (default; captures joint extremes best).
+        - ``'skw'``        : Classic SPATE with sequential Kulldorff weights.
+    b_tdc : torch.Tensor or None
+        Pre-computed TDC weight tensor (pass from ``get_weights_tdc`` or
+        ``get_weights_tdc_masked``).  Must be provided for ``'tdc'`` and
+        ``'tdc_masked'``.
 
-def vid_mi(x, w_sparse):
-    """
-        Local Moran's I for a video (time-series of images)
-
-    :param x: input video of shape [height, width, n_frames]
-    :param w_sparse: spatial weight matrix; torch sparse tensor
-    :return: mis = output data - local Moran's Is
+    Returns
+    -------
+    torch.Tensor of shape (H, W, T−1)
+        SPATE / DeepX values for each cell and time step.
     """
     h, w, n = x.shape
-    mis = torch.stack([mi(x[:, :, i].reshape(-1), w_sparse).reshape(h, w) for i in range(n)])
-    return mis
 
-
-def make_mis(x, w_sparse):
-    """
-        Make Local Moran's I for a batch of videos
-    
-    :param x: input video batch of shape [batch_size, time_steps, n_channel, height, width]
-    :param w_sparse: spatial weight matrix; torch sparse tensor
-    :return: mis = output data - local Moran's I
-    """
-    n, t, nc, h, w = x.shape
-    mis = torch.stack([vid_mi(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), w_sparse) for j in range(nc) for i in range(n)]).reshape(n, t, nc, h, w)
-    mis = torch.stack([(mis[i, :, j, :, :] - torch.min(mis[i, :, j, :, :])) / (torch.max(mis[i, :, j, :, :]) - torch.min(mis[i, :, j, :, :])) for j in range(nc) for i in range(n)]).reshape(n, t, nc, h, w)
-    return mis
-
-
-def spate(x, w_sparse, b, method="skw", b_tdc=None):
-    """
-        Space-time expectations (SPATE or DeepX if method="tdc_masked") for video data, using Local Moran's I.
-    
-    :param x: input video of shape [height, width, n_frames]
-    :param w_sparse: spatial weight matrix; torch sparse tensor
-    :param b: tensor of distance weights of shape [1, 1, time_steps] (Can be computed via temporal_weights())
-    :param method: method to use for computing space-time expectations; default 'skw'
-                (Options are sequential Kulldorff-weighted ('skw'), Kulldorff ('k'), Kulldorff-weighted ('kw'),
-                 Tail Dependence Coefficient ('tdc'), or Tail Dependence Coefficient masked ('tdc_masked'))
-    :param b_tdc: tensor of distance weights for TDC (can be computed via get_weights_tdc_masked())
-    :return: spates = output data - SPATE or DeepX
-    """
-    h, w, n = x.shape
-    if method == "k":
-        x_means = st_ex_kulldorff(x)
-    elif method == "kw":
-        x_means = st_ex_kulldorff_weighted(x, b)
-    ## added
-    elif method == "tdc":
+    if method == "tdc":
         x_means = st_ex_tdc(x, b, b_tdc, mask_on=False)
     elif method == "tdc_masked":
         x_means = st_ex_tdc(x, b, b_tdc, mask_on=True)
     else:
+        # Fallback to classic sequential SPATE
         x_means = st_ex(x, b)
-    if (method=="skw") | (method == "tdc") | (method == "tdc_masked"):
-        spates = torch.stack([mi_mean(x[:, :, i + 1].reshape(-1), x_means[:, :, i].reshape(-1), w_sparse).reshape(h, w) for i in range(n - 1)])
-    else:
-        spates = torch.stack([mi_mean(x[:, :, i].reshape(-1), x_means[:, :, i].reshape(-1), w_sparse).reshape(h, w) for i in range(n)])
-    return spates.permute(1, 2, 0)
+
+    # Compute local Moran's I between x[:,t+1] and expectation x_means[:,t]
+    spates = torch.stack([
+        mi_mean(x[:, :, i + 1].reshape(-1), x_means[:, :, i].reshape(-1), w_sparse).reshape(h, w)
+        for i in range(n - 1)
+    ])
+    return spates.permute(1, 2, 0)   # (H, W, T-1)
 
 
-def make_spates(x, w_sparse, b, method="skw", u=0.8, theta1=0.5, theta2=0.5):
+# ---------------------------------------------------------------------------
+# Batch DeepX computation
+# ---------------------------------------------------------------------------
+
+def make_spates(
+    x: torch.Tensor,
+    w_sparse: torch.Tensor,
+    b: torch.Tensor,
+    method: str = "tdc_masked",
+    u: float = 0.8,
+    theta1: float = 0.5,
+    theta2: float = 0.5,
+) -> torch.Tensor:
     """
-        Make SPATEs(or, DeepX) for a batch of videos
-    
-    :param x: input video batch of shape [batch_size, time_steps, n_channel, height, width]
-    :param w_sparse: spatial weight matrix; torch sparse tensor
-    :param b: tensor of distance weights of shape [1, 1, time_steps] (Can be computed via temporal_weights())
-    :param method: method to use for computing space-time expectations; default 'skw'
-                (Options are sequential Kulldorff-weighted ('skw'), Kulldorff ('k'), Kulldorff-weighted ('kw'))
-    :param u: threshold, default=0.8, only used in 'tdc'
-    :param theta1: parameters to be used in "tdc_masked", the proportion of original SPATE in the combined metric
-    :param theta2: parameters to be used in "tdc_masked", the proportion of new masked DeepX in the combined metric
-    :return: output data - SPATE
+    Compute DeepX embeddings for a full batch of spatiotemporal sequences.
+
+    The output shape matches the input shape but with T replaced by T−1 for
+    the time-sequential methods (``tdc``, ``tdc_masked``, ``skw``).  A zero
+    frame is prepended and the whole tensor is rolled by one step so that the
+    embedding at time t uses only information up to t−1 (causal embedding).
+
+    Parameters
+    ----------
+    x : torch.Tensor, shape (N, T, C, H, W)
+        Batch of real or generated spatiotemporal sequences.
+        N – batch size, T – time steps, C – channels, H – height, W – width.
+    w_sparse : torch.Tensor (sparse), shape (H*W, H*W)
+        Spatial weight matrix (should be on the same device as ``x``).
+    b : torch.Tensor, shape (1, 1, T−1)
+        Temporal decay weights.
+    method : str
+        Embedding method (see ``spate()`` for options).
+    u : float
+        TDC threshold (quantile); only used for ``'tdc'`` and ``'tdc_masked'``.
+    theta1 : float
+        Weight for the classic SPATE component in ``'tdc_masked'``.
+    theta2 : float
+        Weight for the masked DeepX component in ``'tdc_masked'``.
+
+    Returns
+    -------
+    torch.Tensor of shape (N, T, C, H, W)
+        DeepX embedding, normalised per-sample to [0, 1].
+        The first time step contains zeros (no history available at t=0).
     """
     n, t, nc, h, w = x.shape
-    if method == "skw":
-        spates = torch.stack([spate(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), w_sparse, b, method).permute(2, 0, 1) for j in range(nc) for i in range(n)]).reshape(n, t - 1, nc, h, w)
-        spates = torch.stack([(spates[i, :, j, :, :] - torch.min(spates[i, :, j, :, :])) / (torch.max(spates[i, :, j, :, :]) - torch.min(spates[i, :, j, :, :])) for j in range(nc) for i in range(n)]).reshape(n, t - 1, nc, h, w)
-        spates = F.pad(spates, [0, 0, 0, 0, 0, 0, 0, 1, 0, 0])
-        spates = torch.roll(spates, 1, 1)
-    ## added
-    elif method == 'tdc':
-        spates = torch.stack([spate(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), w_sparse, b, method, get_weights_tdc(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), u)).permute(2, 0, 1) for j in range(nc) for i in range(n)]).reshape(n, t - 1, nc, h, w)
-        spates = torch.stack([(spates[i, :, j, :, :] - torch.min(spates[i, :, j, :, :])) / (torch.max(spates[i, :, j, :, :]) - torch.min(spates[i, :, j, :, :])) for j in range(nc) for i in range(n)]).reshape(n, t - 1, nc, h, w)
-        spates = F.pad(spates, [0, 0, 0, 0, 0, 0, 0, 1, 0, 0])
-        spates = torch.roll(spates, 1, 1)
-    ## added
-    elif method == 'tdc_masked':
-        spates_masked = torch.stack([spate(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), w_sparse, b, method, get_weights_tdc_masked(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), u)).permute(2, 0, 1) for j in range(nc) for i in range(n)]).reshape(n, t - 1, nc, h, w)
-        spates_original = torch.stack([spate(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), w_sparse, b, method="skw").permute(2, 0, 1) for j in range(nc) for i in range(n)]).reshape(n, t - 1, nc, h, w)
-        spates = theta1 * spates_original + theta2 * spates_masked
-        spates = torch.stack([(spates[i, :, j, :, :] - torch.min(spates[i, :, j, :, :])) / (torch.max(spates[i, :, j, :, :]) - torch.min(spates[i, :, j, :, :])) for j in range(nc) for i in range(n)]).reshape(n, t - 1, nc, h, w)
-        spates = F.pad(spates, [0, 0, 0, 0, 0, 0, 0, 1, 0, 0])
-        spates = torch.roll(spates, 1, 1)
-    else:
-        spates = torch.stack([spate(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), w_sparse, b, method).permute(2, 0, 1) for j in range(nc) for i in range(n)]).reshape(n, t, nc, h, w)
-        spates = torch.stack([(spates[i, :, j, :, :] - torch.min(spates[i, :, j, :, :])) / (torch.max(spates[i, :, j, :, :]) - torch.min(spates[i, :, j, :, :])) for j in range(nc) for i in range(n)]).reshape(n, t, nc, h, w)
-    return spates
 
+    if method == "tdc_masked":
+        # Compute the masked DeepX component for each sample and channel
+        spates_masked = torch.stack([
+            spate(
+                x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0),  # (H, W, T)
+                w_sparse, b, method,
+                get_weights_tdc_masked(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), u)
+            ).permute(2, 0, 1)   # (T-1, H, W)
+            for j in range(nc) for i in range(n)
+        ]).reshape(n, t - 1, nc, h, w)
+
+        # Also compute the classic SPATE component (for the convex combination)
+        spates_original = torch.stack([
+            spate(
+                x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0),
+                w_sparse, b, method="skw"
+            ).permute(2, 0, 1)
+            for j in range(nc) for i in range(n)
+        ]).reshape(n, t - 1, nc, h, w)
+
+        # Convex combination: theta1 * SPATE + theta2 * DeepX_masked
+        spates = theta1 * spates_original + theta2 * spates_masked
+
+    elif method == "tdc":
+        spates = torch.stack([
+            spate(
+                x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0),
+                w_sparse, b, method,
+                get_weights_tdc(x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0), u)
+            ).permute(2, 0, 1)
+            for j in range(nc) for i in range(n)
+        ]).reshape(n, t - 1, nc, h, w)
+
+    else:
+        # Classic SPATE (skw, k, kw)
+        spates = torch.stack([
+            spate(
+                x[i, :, j, :, :].reshape(t, h, w).permute(1, 2, 0),
+                w_sparse, b, method
+            ).permute(2, 0, 1)
+            for j in range(nc) for i in range(n)
+        ]).reshape(n, t - 1, nc, h, w)
+
+    # Per-sample min-max normalisation to [0, 1]
+    spates = torch.stack([
+        (spates[i, :, j, :, :] - spates[i, :, j, :, :].min()) /
+        (spates[i, :, j, :, :].max() - spates[i, :, j, :, :].min())
+        for j in range(nc) for i in range(n)
+    ]).reshape(n, t - 1, nc, h, w)
+
+    # Prepend a zero frame (no embedding available at t=0) and roll so index 0 contains zeros
+    spates = F.pad(spates, [0, 0, 0, 0, 0, 0, 0, 1, 0, 0])   # pad one step on time axis
+    spates = torch.roll(spates, 1, 1)                          # shift right by 1
+
+    return spates   # (N, T, C, H, W)

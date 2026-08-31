@@ -1,171 +1,261 @@
-import os
-import json
-import sys
+"""
+data_utils.py — Data loading utilities for DeepX-GAN
+=====================================================
+This module handles loading and preprocessing of gridded climate data for
+DeepX-GAN training.  Currently supported: ERA5 daily maximum 2-m temperature
+(t2m daymax) for the MENA (Middle East and North Africa) region.
 
-import argparse
-import time
-from datetime import datetime
+Data are organised as overlapping sliding-window sequences of consecutive summer days
+(JJA: June-July-August) for each year, then min-max normalised to [0, 1].
+
+"""
+
+import os
 import numpy as np
 import pandas as pd
-import xarray as xr  ## process netcdf with xarray needs netcdf4 package to be installed
+import torch
+import xarray as xr
+from torch.utils.data import Dataset, DataLoader
 
-import cv2
-import torch.nn as nn
-from torch.utils.data import Dataset, IterableDataset, DataLoader
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.autograd import Variable
-from torch.utils.tensorboard import SummaryWriter
-from scipy import io
 
+# ---------------------------------------------------------------------------
+# Dataset registry
+# ---------------------------------------------------------------------------
+
+# Maps a user-facing dataset name (passed as --dname) to the NetCDF filename,
+# the variable name inside the file, and the name of the time coordinate.
+# Add new datasets here to make them available without changing any other code.
+DATASET_REGISTRY: dict = {
+    'era5-t2m-daymax': {
+        'filename':    'era5.reanalysis.t2m.daymax.32x64.1979-2014.MENA.nc',
+        'nc_var':      't2m',
+        'time_dim':    'valid_time',
+        'description': 'ERA5 daily maximum 2-m temperature, 1979-2014, MENA (32 x 64 grid)',
+    },
+    # ---- Template for adding a new dataset --------------------------------
+    # 'my-dataset-name': {
+    #     'filename':    'my_data.nc',
+    #     'nc_var':      'var_name_in_netcdf',
+    #     'time_dim':    'time',
+    #     'description': 'Short description shown in logs',
+    # },
+}
+
+
+# ---------------------------------------------------------------------------
+# Dataset wrapper
+# ---------------------------------------------------------------------------
 
 class MyDataset(Dataset):
     """
-        Custom dataset class for handling climate data.
-    
-    :param data: climate data as a tensor
-    :return: a dataset of stacked tensor samples from a list of time snapshots.
-             For each batch, timesnapshot = [time_step, n_channel=2 for dataset_full, image_height, image_width].
+    Simple map-style PyTorch Dataset that wraps a 5-D tensor of climate sequences.
+
+    Each item is a single spatiotemporal sequence window of shape
+    ``(time_steps, n_channels, height, width)``.
     """
-    def __init__(self, data):
+
+    def __init__(self, data: torch.Tensor):
+        """
+        Parameters
+        ----------
+        data : torch.Tensor, shape (N, T, C, H, W)
+            N   - number of sequence samples
+            T   - number of time steps per sample
+            C   - number of channels (1 for univariate temperature)
+            H,W - spatial height and width of the domain
+        """
         self.data = data
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.data.shape[0]
 
-    def __getitem__(self, item):
-        timesnapshot = self.data[item]  ## 
-        return timesnapshot
+    def __getitem__(self, item: int) -> torch.Tensor:
+        # Returns one spatiotemporal sequence of shape (T, C, H, W)
+        return self.data[item]
 
 
-def season_preprocess(data, time, season, time_steps=30):
+# ---------------------------------------------------------------------------
+# Season extraction helper
+# ---------------------------------------------------------------------------
+
+def season_preprocess(data: torch.Tensor, time, season: str, time_steps: int = 30) -> torch.Tensor:
     """
-        Used for event definition for a specific season.
+    Extract sliding-window sequences of consecutive summer days (JJA) for every year.
 
-    :param time_steps: the number of time steps to subset the dataset.
-    :param data: climate variable for 1979-2022.
-    :param time: time data array
-    :param season: e.g., 'JJA'
-    :return: a dataset of stacked tensor samples from a list of time snapshots.
+    For each year in the dataset we select the June-August days and build all
+    overlapping windows of length ``time_steps`` with stride 1.  Windows from
+    different years are concatenated along the first (batch) dimension.
+
+    Parameters
+    ----------
+    data : torch.Tensor, shape (total_days, H, W)
+        Full time series of daily gridded temperature values.
+    time : xarray DataArray
+        Time coordinate corresponding to the first axis of ``data``.
+    season : str
+        Target season.  Currently only ``'JJA'`` is supported.
+    time_steps : int
+        Length of each sequence window (number of days).
+
+    Returns
+    -------
+    data_seq : torch.Tensor, shape (N_windows, T, H, W)
+        All extracted sliding-window sequences stacked along the first axis.
     """
     if season == 'JJA':
-        month_want = [6, 7, 8]
-    df = pd.DataFrame()
-    df['time'] = time
-    df['month'] = df['time'].dt.month
-    df['year'] = df['time'].dt.year
+        month_want = [6, 7, 8]   # June, July, August
+    else:
+        raise ValueError(f"Unsupported season '{season}'. Use 'JJA'.")
+
+    # Build a helper DataFrame for year/month indexing
+    df = pd.DataFrame({'time': time.values})
+    df['month'] = pd.to_datetime(df['time']).dt.month
+    df['year'] = pd.to_datetime(df['time']).dt.year
+
     data_seq = []
-    for year in range(1979, 2023):
-        # df_subset = df.loc[(df['year'] == year) & (df['month'].isin(month_want))]  ## check if selected year month is correct
-        data_subset = data[(df['year'] == year) & (df['month'].isin(month_want)), ...]
-        data_seq_subset = [data_subset[i:i + time_steps, ...] for i in range(data_subset.shape[0] - time_steps + 1)]
-        data_seq_subset = torch.stack(data_seq_subset, dim=0)
-        data_seq.append(data_seq_subset)
-    data_seq = torch.vstack(data_seq)
-    return data_seq
+    unique_years = df['year'].unique()
+
+    for year in unique_years:
+        # Select days in the target months for this year
+        mask = (df['year'] == year) & (df['month'].isin(month_want))
+        data_yr = data[mask.values, ...]   # shape (n_days_yr, H, W)
+
+        if data_yr.shape[0] < time_steps:
+            # Skip years with fewer days than the requested window length
+            continue
+
+        # Build all overlapping windows of length time_steps
+        windows = [data_yr[i:i + time_steps, ...] for i in range(data_yr.shape[0] - time_steps + 1)]
+        data_seq.append(torch.stack(windows, dim=0))   # (n_windows, T, H, W)
+
+    return torch.vstack(data_seq)   # (total_windows, T, H, W)
 
 
-## fetch data in data_utils
-def fetch_climate(var_name, time_steps=50, season='full_year'):
+# ---------------------------------------------------------------------------
+# Main data loading function
+# ---------------------------------------------------------------------------
+
+def fetch_climate_data(
+    dname: str,
+    data_dir: str = '../DATA/',
+    time_steps: int = 30,
+    season: str = 'JJA',
+    debug_run: bool = False,
+    minmax_stats: dict = None,
+    return_minmax_stats: bool = False,
+):
     """
-        Load climate vars from NCEP reanalysis files.
+    Load a registered climate dataset and prepare spatiotemporal sequence
+    windows for DeepX-GAN training.
 
-    :param var_name: e.g., 'air', 'tmax'
-    :param time_steps: to determine # time steps for each sample
-    :param season: e.g., 'full_year', 'JJA'
-    :return: [sample_size, time_steps, n_channel(=1), height, width]
+    The dataset is resolved from ``DATASET_REGISTRY`` using ``dname``.
+    To add a new dataset, insert a new entry into ``DATASET_REGISTRY`` at the
+    top of this file — no other code changes are required.
+
+    Parameters
+    ----------
+    dname : str
+        Dataset identifier, must be a key in ``DATASET_REGISTRY``
+        (e.g. ``'era5-t2m-daymax'``).
+    data_dir : str
+        Base directory that contains the NetCDF files.  The filename from
+        ``DATASET_REGISTRY`` is appended to form the full path.
+        Default: ``'../DATA/'``.
+    time_steps : int
+        Number of consecutive days in each sequence window fed to the GAN.
+        Default is 30 (approximately one summer month).
+    season : str
+        Season to extract.  Use ``'JJA'`` to keep only June-August days,
+        or ``'full_year'`` to use all days with sliding windows.
+    debug_run : bool
+        If ``True``, only the first 64 samples are kept.  Useful for quick
+        sanity-checks without running the full dataset.
+    minmax_stats : dict or None
+        Pre-computed normalisation bounds ``{'min': val, 'max': val}``.
+        If ``None``, statistics are computed from the current dataset.
+    return_minmax_stats : bool
+        If ``True``, also return the normalisation statistics dictionary.
+
+    Returns
+    -------
+    dataset : MyDataset
+        PyTorch dataset with items of shape ``(T, C=1, H, W)`` normalised to [0, 1].
+    x_height : int
+        Spatial height (number of latitude grid points).
+    x_width : int
+        Spatial width (number of longitude grid points).
+    minmax_stats : dict  (only when ``return_minmax_stats=True``)
+        ``{'min': torch.Tensor, 'max': torch.Tensor}`` used for normalisation.
     """
-    # load data
-    if var_name == 'air':
-        fn = '../DATA/air.2m.gauss.1979-2022.wana5.nc'
-    elif var_name == 'tmax':
-        fn = '../DATA/tmax.2m.gauss.1979-2022.wana.nc'
-    ds = xr.open_dataset(fn)
-    var = ds[var_name].values  # ndarray
 
-    ## transform to torch tensor
-    data = torch.from_numpy(var)
+    # ------------------------------------------------------------------
+    # 1. Resolve file path and variable metadata from the registry
+    # ------------------------------------------------------------------
+    if dname not in DATASET_REGISTRY:
+        raise ValueError(
+            f"Unknown dataset '{dname}'. "
+            f"Available datasets: {list(DATASET_REGISTRY.keys())}"
+        )
+    entry      = DATASET_REGISTRY[dname]
+    data_path  = os.path.join(data_dir, entry['filename'])
+    nc_var     = entry['nc_var']
+    time_dim   = entry['time_dim']
+    print(f"  Dataset : {entry['description']}")
+    print(f"  File    : {data_path}")
 
-    # Prepare dataset
-    if (var_name == 'air') | (var_name == 'tmax'):
-        ## if var_name==air, the data has a dimension called level, which has dimension one
-        total_time_steps, n_level, x_height, x_width = data.shape
-        data = data.reshape(total_time_steps, x_height, x_width)
-    else:
-        total_time_steps, x_height, x_width = data.shape
+    # ------------------------------------------------------------------
+    # 2. Open NetCDF and extract the climate variable array
+    # ------------------------------------------------------------------
+    ds = xr.open_dataset(data_path)
+    var        = ds[nc_var].values      # numpy ndarray, shape (T_total, H, W)
+    time_coord = ds[time_dim]           # xarray DataArray with datetime values
 
-    ## preprocess the data to get seasonal events
+    data = torch.from_numpy(var)    # Convert to PyTorch tensor
+
+    # Remove singleton level dimension if present (some NCEP variables have it)
+    if data.dim() == 4 and data.shape[1] == 1:
+        data = data.squeeze(1)
+    if data.dim() != 3:
+        raise ValueError(f"Expected 3-D data (time, H, W), got shape {data.shape}.")
+
+    total_days, x_height, x_width = data.shape
+
+    # ------------------------------------------------------------------
+    # 3. Extract seasonal windows
+    # ------------------------------------------------------------------
     if season == 'full_year':
-        ## time slicing by one-length time-window
-        # data_seq = [torch.reshape(data[i:i+((total_time_steps-i) // time_steps)*time_steps, ...], ((total_time_steps-i) // time_steps, time_steps, x_height, x_width)) for i in range(time_steps)]
-        # data_seq = torch.vstack(data_seq)  ## stack the tensors along the first axis
-        data_seq = [data[i:i + time_steps, ...] for i in range(total_time_steps - time_steps + 1)]
-        data_seq = torch.stack(data_seq, dim=0)
+        # Sliding windows over the entire time axis (no month filtering)
+        windows = [data[i:i + time_steps, ...] for i in range(total_days - time_steps + 1)]
+        data_seq = torch.stack(windows, dim=0)   # (N, T, H, W)
     else:
-        data_seq = season_preprocess(data, ds['time'], season, time_steps=time_steps)  ## data, time, season, time_steps = 30
+        # Extract JJA windows year by year
+        data_seq = season_preprocess(data, time_coord, season, time_steps=time_steps)
 
-    ## reshape
-    data_seq = data_seq.reshape(data_seq.shape[0], data_seq.shape[1], 1, data_seq.shape[2], data_seq.shape[3])
-    ## test with few samples
-    data_seq = data_seq[:128, ...]
+    # ------------------------------------------------------------------
+    # 4. Add channel dimension: (N, T, H, W) → (N, T, C=1, H, W)
+    # ------------------------------------------------------------------
+    data_seq = data_seq.unsqueeze(2)   # insert channel axis
 
-    # normalise data between 0 and 1
-    data_seq = (data_seq - torch.min(data_seq)) / (torch.max(data_seq) - torch.min(data_seq))
+    # ------------------------------------------------------------------
+    # 5. Optional: limit to a small subset for debugging
+    # ------------------------------------------------------------------
+    if debug_run:
+        data_seq = data_seq[:64, ...]
+        print(f"  [debug_run] Restricting to {data_seq.shape[0]} samples.")
+
+    # ------------------------------------------------------------------
+    # 6. Min-max normalisation to [0, 1]
+    # ------------------------------------------------------------------
+    if minmax_stats is None:
+        minmax_stats = {
+            'min': torch.min(data_seq),
+            'max': torch.max(data_seq),
+        }
+    data_seq = (data_seq - minmax_stats['min']) / (minmax_stats['max'] - minmax_stats['min'])
+
     dataset = MyDataset(data_seq)
+    print(f"  Samples : {data_seq.shape[0]}  |  Grid: {x_height} × {x_width}")
+
+    if return_minmax_stats:
+        return dataset, x_height, x_width, minmax_stats
     return dataset, x_height, x_width
-
-
-def fetch_lgcp(time_steps=10, x_size=32, method='pyrDown'):
-    """
-        Load lgcp data from a .mat file and preprocess it.
-    
-    :param time_steps: 10, or 50
-    :param x_size: 16, 32, or 64
-    :param method: 'pyrDown', 'resize', or simple 'crop'
-    :return: [sample_size, time_steps, n_channel(=1), height, width]
-    """
-    data = io.loadmat('../DATA/lgcp.mat')
-    data = data["lgcp"]
-
-    # crop the sample height&width
-    if x_size == 16:
-        if method == 'crop':
-            data = data[25:41, 25:41, :]
-        elif method == 'pyrDown':
-            data_coarse = [cv2.pyrDown(data[:, :, i]) for i in range(data.shape[2])]
-            data_coarse = [cv2.pyrDown(data_coarse[i]) for i in range(data.shape[2])]
-            data_coarse = np.asarray(data_coarse)
-            data_coarse = data_coarse.transpose((1, 2, 0))
-            data = data_coarse
-        elif method == 'resize':
-            down_data = np.empty((x_size, x_size, data.shape[2]), np.float32)
-            for j in range(data.shape[2]):
-                down_data[..., j] = cv2.resize(data[..., j], dsize=(x_size, x_size))
-                data = down_data
-    elif x_size == 32:
-        if method == 'crop':
-            data = data[::2, 1::2, :]
-        elif method == 'pyrDown':
-            data_coarse = [cv2.pyrDown(data[:, :, i]) for i in range(data.shape[2])]
-            data_coarse = np.asarray(data_coarse)
-            data_coarse = data_coarse.transpose((1, 2, 0))
-            data = data_coarse
-        elif method == 'resize':
-            down_data = np.empty((x_size, x_size, data.shape[2]), np.float32)
-            for j in range(data.shape[2]):
-                down_data[..., j] = cv2.resize(data[..., j], dsize=(x_size, x_size))
-                data = down_data
-
-    data = torch.tensor(data)
-    x_height, x_width, total_time_steps = data.shape
-    data_seq = torch.reshape(data, (x_height, x_width, total_time_steps // time_steps, time_steps))
-    raw_data = data_seq.permute(0, 2, 1, 3).permute(1, 0, 2, 3).permute(0, 1, 3, 2).permute(0, 2, 1, 3)
-    # normalise data between 0 and 1
-    data = (raw_data - torch.min(raw_data)) / (torch.max(raw_data) - torch.min(raw_data))
-    data = data.reshape(total_time_steps // time_steps, time_steps, 1, x_height, x_width)
-    data = data[:64, ...]
-    dataset = MyDataset(data)
-    return dataset, x_height, x_width
-
