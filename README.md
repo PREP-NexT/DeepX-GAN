@@ -1,7 +1,6 @@
 # DeepX-GAN
 
-The code repository for the paper **"Capturing Unseen Spatial Heat Extremes Through Dependence-Aware Generative Modeling"**.  
-A preprint is available at [arXiv: 2507.09211](https://arxiv.org/abs/2507.09211).
+The code repository for the paper **"Capturing Unseen Spatial Heat Extremes Through Dependence-Aware Generative Modeling"**, published in [Earth's Future](https://agupubs.onlinelibrary.wiley.com/doi/full/10.1029/2026EF008861) in Sep 2026.  
 
 ---
 
@@ -13,7 +12,7 @@ A preprint is available at [arXiv: 2507.09211](https://arxiv.org/abs/2507.09211)
 
 ## Data
 
-The example dataset (ERA5 daily maximum 2-m temperature for the MENA region) [link](https://drive.google.com/file/d/1agxGISWhy1zEz_efa7uxoIW_ct4402or/view?usp=sharing) is required to run the code. It is shared on Google Drive due to GitHub's file size limit and needs to be placed in the `DATA/` directory one level above this folder (i.e. `../DATA/`):
+The example dataset (ERA5 daily maximum 2-m temperature for the MENA region) [link](https://drive.google.com/file/d/1agxGISWhy1zEz_efa7uxoIW_ct4402or/view?usp=sharing) is required to run the code. It is shared on Google Drive due to GitHub's file size limit and needs to be placed in the `DATA/` directory one level above this folder (i.e., `../DATA/`):
 
 | File | Description |
 |------|-------------|
@@ -136,7 +135,23 @@ The code has been tested on **Ubuntu 20.04** using **NVIDIA RTX A6000 GPUs**.  I
 
 ## Citation
 
-If you use this code, please cite our paper.
+You are very welcome to use this code, and please cite our paper.
+
+Liu, Xinyue, Xiao Peng, Shuyue Yan, et al. “Capturing Unseen Spatial Heat Extremes Through Dependence-Aware Generative Modeling.” Earth’s Future 14, no. 9 (2026): e2026EF008861. https://doi.org/10.1029/2026EF008861.
+
+@article{Liu2026Capturing,
+  title = {Capturing {{Unseen Spatial Heat Extremes Through Dependence-Aware Generative Modeling}}},
+  author = {Liu, Xinyue and Peng, Xiao and Yan, Shuyue and Chen, Yuntian and Zhang, Dongxiao and Niu, Zhixiao and Wang, Hui-Min and He, Xiaogang},
+  date = {2026},
+  journaltitle = {Earth's Future},
+  volume = {14},
+  number = {9},
+  pages = {e2026EF008861},
+  issn = {2328-4277},
+  doi = {10.1029/2026EF008861},
+  url = {https://onlinelibrary.wiley.com/doi/abs/10.1029/2026EF008861}
+}
+
 
 
 ---
